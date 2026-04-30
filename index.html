@@ -567,6 +567,7 @@
     overflow-x: auto;
   }
 </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 </head>
 <body>
 
@@ -1430,466 +1431,984 @@
   </div>
 </div>
 
+
 <script>
-// ══════════════════════════════════════════
-// DATA ENGINE — Simulated from actual CSVs
-// ══════════════════════════════════════════
 
-// Defect normalizer — fuzzy map
-const DEFECT_MAP = {
-  'surf_delamination':'Surface Delamination','surf-delam':'Surface Delamination','SurfDeLam':'Surface Delamination',
-  'surface delamination':'Surface Delamination','surface_delamination':'Surface Delamination','Surface Delamination':'Surface Delamination',
-  'edgecrack':'Edge Crack','EdgeCrack':'Edge Crack','edge crack':'Edge Crack','edge_crack':'Edge Crack','Edge Crack':'Edge Crack',
-  'DimDev':'Dimensional Deviation','dim_deviation':'Dimensional Deviation','dimensional deviation':'Dimensional Deviation',
-  'dimensional_deviation':'Dimensional Deviation','Dimensional Deviation':'Dimensional Deviation'
-};
-function normalizeDefect(d){ return DEFECT_MAP[d] || d || '—'; }
+// ══════════════════════════════════════════════════════════════════════════
+// TRACEAI v2.0 — REAL DATA ENGINE
+// All hardcoded data removed. Driven entirely by uploaded CSV files.
+// ══════════════════════════════════════════════════════════════════════════
 
-// Seed risk data from production patterns
-const machines = ['MC-01','MC-02','MC-03','MC-04','MC-05'];
-const shifts = ['A','B','C'];
-const defectTypes = ['Surface Delamination','Edge Crack','Dimensional Deviation'];
-const knownBadLots = ['LOT-2023-114','LOT-2024-088','LOT-2023-020'];
-const knownBadMachines = ['MC-03']; // from complaint C002
+// ── GLOBAL DATA STORES ──────────────────────────────────────────────────
+let rawMaterials = [];   // from raw_materials_log.csv
+let production   = [];   // from production_log.csv
+let qc           = [];   // from qc_inspection.csv
+let dispatch     = [];   // from dispatch_log.csv
+let suppliers    = [];   // from supplier_master.csv
+let complaints   = [];   // from defect_complaints.csv
 
-// Generate risk scores for top 50 batches
-function generateRiskBatches(n=80){
-  const rows = [];
-  // Known bad ones first
-  const badCases = [
-    {batch:'BATCH-2023-0017',lot:'LOT-2023-049',machine:'MC-05',shift:'A',qc:'FAIL',defect:'Surface Delamination',rate:2.66,score:88},
-    {batch:'BATCH-2023-0088',lot:'LOT-2023-114',machine:'MC-03',shift:'B',qc:'FAIL',defect:'Surface Delamination',rate:3.8,score:92},
-    {batch:'BATCH-2023-0101',lot:'LOT-2023-114',machine:'MC-01',shift:'C',qc:'FAIL',defect:'Surface Delamination',rate:1.48,score:85},
-    {batch:'BATCH-2023-0079',lot:'LOT-2024-088',machine:'MC-03',shift:'B',qc:'FAIL',defect:'Edge Crack',rate:2.36,score:79},
-    {batch:'BATCH-2023-0092',lot:'LOT-2024-101',machine:'MC-04',shift:'A',qc:'FAIL',defect:'Dimensional Deviation',rate:0.54,score:72},
-    {batch:'BATCH-2023-0137',lot:'LOT-2023-153',machine:'MC-02',shift:'B',qc:'FAIL',defect:'Dimensional Deviation',rate:4.14,score:76},
-    {batch:'BATCH-2023-0138',lot:'LOT-2024-088',machine:'MC-03',shift:'A',qc:'FAIL',defect:'Edge Crack',rate:1.54,score:74},
-    {batch:'BATCH-2023-0175',lot:'LOT-2023-020',machine:'MC-05',shift:'B',qc:'FAIL',defect:'Edge Crack',rate:2.21,score:71},
-  ];
-  badCases.forEach(r=>rows.push(r));
-  // Medium risk
-  for(let i=0;i<30;i++){
-    const score=40+Math.floor(Math.random()*30);
-    rows.push({
-      batch:`BATCH-2023-${String(200+i).padStart(4,'0')}`,
-      lot:`LOT-2023-${String(50+i).padStart(3,'0')}`,
-      machine:machines[i%5],shift:shifts[i%3],
-      qc:score>55?'FAIL':'PASS',
-      defect:score>55?defectTypes[i%3]:'',
-      rate:score>55?(Math.random()*2+0.3).toFixed(2):0,
-      score
-    });
-  }
-  // Low risk
-  for(let i=0;i<42;i++){
-    rows.push({
-      batch:`BATCH-2024-${String(1000+i).padStart(4,'0')}`,
-      lot:`LOT-2024-${String(100+i).padStart(3,'0')}`,
-      machine:machines[i%5],shift:shifts[i%3],
-      qc:'PASS',defect:'',rate:0,
-      score:5+Math.floor(Math.random()*35)
-    });
-  }
-  return rows;
-}
+// ── PRE-BUILT LOOKUP MAPS (populated after all CSVs load) ───────────────
+let mapBatchToProduction  = {};  // batchId → production row
+let mapBatchToQC          = {};  // batchId → qc row
+let mapLotToRawMaterials  = {};  // lotNumber → [raw material rows]
+let mapLotToProduction    = {};  // lotNumber → [production rows]
+let mapOrderToDispatch    = {};  // orderId → dispatch row
+let mapBatchToDispatch    = {};  // batchId → [dispatch rows]
+let mapSupplier           = {};  // supplierId → supplier row
+let mapLotToSupplier      = {};  // lotNumber → supplier row (via raw materials)
 
-const ALL_RISK_DATA = generateRiskBatches();
-const blockedBatches = new Set(['BATCH-2023-0088','BATCH-2023-0101']);
+// ── DATA LOADED FLAGS ────────────────────────────────────────────────────
+const loaded = { raw:false, prod:false, qc:false, dispatch:false, supplier:false, complaints:false };
+
+let blockedBatches = new Set();
 let pendingEntries = 0;
-let opBatchCounter = 5401;
+let opBatchCounter = 1;
+let ALL_RISK_DATA  = [];
 
-// ── DISPATCH SIMULATION DATA ──
-const DISPATCH_DATA = {
-  'D-1847': {customer:'OEM-TATA', batch:'BATCH-2023-0088', product:'Brake Pad Type A', qty:340, date:'2024-02-15', status:'Delivered', vehicle:'MH12-7719'},
-  'D-1921': {customer:'OEM-TATA', batch:'BATCH-2023-0101', product:'Brake Pad Type A', qty:220, date:'2024-03-01', status:'Delivered', vehicle:'MH12-8830'},
-  'D-1044': {customer:'OEM-MAHINDRA', batch:'BATCH-2023-0079', product:'Brake Pad Type B', qty:88, date:'2023-08-05', status:'Delivered', vehicle:'MH12-4520'},
-  'D-1367': {customer:'OEM-BAJAJ', batch:'BATCH-2023-0137', product:'Clutch Assembly', qty:55, date:'2024-01-10', status:'Delivered', vehicle:'MH12-3310'},
+
+// ══════════════════════════════════════════════════════════════════════════
+// DEFECT NORMALIZER
+// ══════════════════════════════════════════════════════════════════════════
+const DEFECT_MAP = {
+  'surf_delamination':'Surface Delamination','surf-delam':'Surface Delamination',
+  'surfdelam':'Surface Delamination','surface delamination':'Surface Delamination',
+  'surface_delamination':'Surface Delamination','SurfDeLam':'Surface Delamination',
+  'edgecrack':'Edge Crack','edge crack':'Edge Crack','edge_crack':'Edge Crack',
+  'EdgeCrack':'Edge Crack','edge burrs':'Edge Crack','edgeburrs':'Edge Crack',
+  'DimDev':'Dimensional Deviation','dimdev':'Dimensional Deviation',
+  'dim_deviation':'Dimensional Deviation','dimensional deviation':'Dimensional Deviation',
+  'dimensional_deviation':'Dimensional Deviation','dim dev':'Dimensional Deviation',
+  'porosity':'Porosity','surface porosity':'Porosity',
+  'delamination':'Surface Delamination',
 };
-const CONTAM_LOT_DATA = {
-  'LOT-2023-114': {
-    supplier:'S03 — Sundaram Clayton', material:'Adhesive bonding agent',
-    grade:'C', issue:'Below spec — bonding agent concentration 23% below minimum',
-    batches:['BATCH-2023-0088','BATCH-2023-0101','BATCH-2023-0114','BATCH-2023-0115','BATCH-2023-0116'],
-    orders:['D-1847','D-1921','D-1367','D-1890'],
-    impact:'₹2,94,500'
+function normalizeDefect(d) {
+  if (!d) return '';
+  const key = (d || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  // Direct lookup
+  if (DEFECT_MAP[d.trim()]) return DEFECT_MAP[d.trim()];
+  if (DEFECT_MAP[key]) return DEFECT_MAP[key];
+  // Fuzzy: check if any canonical keyword exists in the string
+  if (key.includes('delam')) return 'Surface Delamination';
+  if (key.includes('crack') || key.includes('burr')) return 'Edge Crack';
+  if (key.includes('dim') || key.includes('dev')) return 'Dimensional Deviation';
+  return d.trim() || '';
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// DATE NORMALIZER — handles DD/MM/YYYY, MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD
+// ══════════════════════════════════════════════════════════════════════════
+function normalizeDate(raw) {
+  if (!raw) return '';
+  const s = (raw + '').trim();
+  if (!s) return '';
+
+  // ISO: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+
+  // DD/MM/YYYY
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) {
+    const [d, m, y] = s.split('/');
+    const mo = parseInt(m, 10), dy = parseInt(d, 10);
+    // Disambiguate: if first part > 12, must be day
+    if (dy > 12) return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+    // If second part > 12, must be day → MM/DD pattern (US)
+    if (mo > 12) return `${y}-${d.padStart(2,'0')}-${m.padStart(2,'0')}`;
+    // Default assume DD/MM/YYYY (Indian convention)
+    return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
   }
-};
-const SUPPLIER_DATA = {
-  S01:{name:'Tata Metaliks Ltd',material:'Brake lining compound',defects:3,risk:'Medium'},
-  S02:{name:'Minda Industries',material:'Backing plate steel',defects:1,risk:'Low'},
-  S03:{name:'Sundaram Clayton',material:'Adhesive bonding agent',defects:7,risk:'High'},
-  S04:{name:'JK Rubber Pvt Ltd',material:'Friction modifier',defects:4,risk:'Medium'},
-  S05:{name:'Minda Industries (Rivets)',material:'Rivet hardware',defects:1,risk:'Low'},
-  S06:{name:'Anand Automotive',material:'Surface treatment chemical',defects:2,risk:'Low'},
-};
 
-// ══════════════════════════════════════════
-// PAGE NAVIGATION
-// ══════════════════════════════════════════
-function showPage(name){
-  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('page-'+name).classList.add('active');
-  document.querySelector(`[data-page="${name}"]`).classList.add('active');
-  if(name==='risk') renderRiskTable();
-  if(name==='bi') renderBI();
-  if(name==='operator') generateBatchPreview();
+  // MM/DD/YYYY (US) — when first part ≤12 and second > 12
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
+    const parts = s.split('/');
+    const m = parseInt(parts[0], 10), d = parseInt(parts[1], 10), y = parts[2];
+    return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+
+  // DD-MM-YYYY or MM-DD-YYYY with dashes
+  // Real data audit: 25-04-2023, 15-04-2023, 28-10-2023 are all DD-MM-YYYY (Indian factory convention)
+  if (/^\d{2}-\d{2}-\d{4}$/.test(s)) {
+    const [a, b, y] = s.split('-');
+    const ai = parseInt(a, 10), bi = parseInt(b, 10);
+    if (ai > 12) return `${y}-${b.padStart(2,'0')}-${a.padStart(2,'0')}`;  // unambiguously DD-MM
+    if (bi > 12) return `${y}-${a.padStart(2,'0')}-${b.padStart(2,'0')}`;  // unambiguously MM-DD
+    // Ambiguous (both ≤ 12): Indian factory convention → DD-MM-YYYY
+    return `${y}-${b.padStart(2,'0')}-${a.padStart(2,'0')}`;
+  }
+
+  return s; // fallback: return as-is
 }
 
-// ══════════════════════════════════════════
-// DASHBOARD INIT
-// ══════════════════════════════════════════
-function initDashboard(){
-  const high = ALL_RISK_DATA.filter(r=>r.score>70).length;
-  document.getElementById('kpi-highrisk').textContent = high;
+function safeStr(v) { return (v !== null && v !== undefined) ? String(v).trim() : ''; }
+function safeNum(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
 
-  // Alerts
-  const alertsDiv = document.getElementById('dash-alerts');
-  alertsDiv.innerHTML = `
-    <div class="alert-banner danger mb12">
-      <div class="alert-icon">🔴</div>
-      <div>
-        <div class="alert-title">ACTIVE RECALL — LOT-2023-114 (Sundaram Clayton — Adhesive)</div>
-        <div class="alert-body">5 batches affected · 4 dispatch orders · OEM-TATA, OEM-BAJAJ impacted · ₹2,94,500 estimated cost · <strong>Immediate action required</strong></div>
-      </div>
-    </div>`;
 
-  // Recent failures table
-  const fails = ALL_RISK_DATA.filter(r=>r.qc==='FAIL').slice(0,8);
-  document.getElementById('recent-failures-tbody').innerHTML = fails.map(r=>`
-    <tr class="${r.score>70?'risk-high':r.score>40?'risk-med':'risk-low'}">
-      <td>${r.batch}</td>
-      <td>${r.defect||'—'}</td>
-      <td style="color:var(--red)">${r.rate}%</td>
-      <td>${riskBadge(r.score)}</td>
-      <td>${blockedBatches.has(r.batch)?'<span class="blocked-badge">🚫 BLOCKED</span>':'<span class="tag tag-yellow">⚠ REVIEW</span>'}</td>
-    </tr>`).join('');
+// ══════════════════════════════════════════════════════════════════════════
+// PAPAPARSE CSV PARSER (loaded from CDN in HTML head)
+// ══════════════════════════════════════════════════════════════════════════
+function parseCSV(file) {
+  return new Promise((resolve, reject) => {
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      transformHeader: h => safeStr(h).toLowerCase().replace(/\s+/g,'_'),
+      complete: r => resolve(r.data),
+      error:    e => reject(e),
+    });
+  });
 }
 
-function riskBadge(score){
-  if(score>70) return `<span class="tag tag-red">🔴 ${score}</span>`;
-  if(score>40) return `<span class="tag tag-yellow">🟡 ${score}</span>`;
-  return `<span class="tag tag-green">🟢 ${score}</span>`;
+
+// ══════════════════════════════════════════════════════════════════════════
+// DATA CLEANING PIPELINES
+// ══════════════════════════════════════════════════════════════════════════
+function cleanRawMaterials(rows) {
+  return rows.map(r => ({
+    receipt_date:   normalizeDate(safeStr(r.receipt_date)),
+    supplier_id:    safeStr(r.supplier_id).toUpperCase(),
+    material_type:  safeStr(r.material_type),
+    lot_number:     safeStr(r.lot_number).toUpperCase().replace(/\s/g,''),
+    quantity_kg:    safeNum(r.quantity_kg),
+    quality_grade:  safeStr(r.quality_grade).toUpperCase() || 'A',
+    inspector_name: safeStr(r.inspector_name),
+  })).filter(r => r.lot_number);
 }
 
-// ══════════════════════════════════════════
-// TRACE ENGINE
-// ══════════════════════════════════════════
-function updateTracePlaceholder(){
-  const t = document.getElementById('trace-type').value;
-  const placeholders = {order:'D-1847',batch:'BATCH-2023-0088',lot:'LOT-2023-114'};
-  document.getElementById('trace-input').placeholder = `Enter ${placeholders[t]}`;
+function cleanProduction(rows) {
+  return rows.map((r, idx) => ({
+    date:           normalizeDate(safeStr(r.date)),
+    shift:          safeStr(r.shift).toUpperCase() || 'A',
+    machine_id:     safeStr(r.machine_id).toUpperCase() || safeStr(r.machine).toUpperCase(),
+    operator_id:    safeStr(r.operator_id).toUpperCase() || safeStr(r.operator).toUpperCase(),
+    batch_id:       safeStr(r.batch_id).toUpperCase().replace(/\s/g,''),
+    input_lot_ref:  safeStr(r.input_lot_ref).toUpperCase().replace(/\s/g,'') || safeStr(r.lot_number).toUpperCase().replace(/\s/g,''),
+    units_produced: safeNum(r.units_produced),
+    cycle_time_min: safeNum(r.cycle_time_min),
+    _idx:           idx,
+  })).filter(r => r.date || r.machine_id);
 }
 
-function runTrace(demo){
+function cleanQC(rows) {
+  return rows.map(r => ({
+    batch_id:        safeStr(r.batch_id).toUpperCase().replace(/\s/g,''),
+    inspection_date: normalizeDate(safeStr(r.inspection_date)),
+    inspector_id:    safeStr(r.inspector_id).toUpperCase(),
+    pass_fail:       safeStr(r.pass_fail).toUpperCase() || 'PASS',
+    defect_type:     normalizeDefect(safeStr(r.defect_type)),
+    defect_rate_pct: safeNum(r.defect_rate_pct),
+    rework_flag:     safeStr(r.rework_flag).toUpperCase() || 'N',
+  })).filter(r => r.batch_id);
+}
+
+function cleanDispatch(rows) {
+  return rows.map(r => ({
+    dispatch_date:  normalizeDate(safeStr(r.dispatch_date)),
+    order_id:       safeStr(r.order_id).toUpperCase().trim(),
+    customer_id:    safeStr(r.customer_id).toUpperCase().trim(),
+    product_type:   safeStr(r.product_type),
+    quantity:       safeNum(r.quantity),
+    // ← CRITICAL FIX: split multi-batch comma-separated refs
+    batch_refs:     safeStr(r.batch_ref || r.batch_refs || '').toUpperCase()
+                      .split(',').map(b => b.trim()).filter(Boolean),
+    vehicle_number: safeStr(r.vehicle_number || r.vehicle),
+  })).filter(r => r.order_id);
+}
+
+function cleanSuppliers(rows) {
+  return rows.map(r => ({
+    supplier_id:      safeStr(r.supplier_id).toUpperCase(),
+    supplier_name:    safeStr(r.supplier_name),
+    material_supplied:safeStr(r.material_supplied),
+    lead_time_days:   safeNum(r.lead_time_days),
+    approved_status:  safeStr(r.approved_status),
+  })).filter(r => r.supplier_id);
+}
+
+function cleanComplaints(rows) {
+  return rows.map(r => ({
+    complaint_id:          safeStr(r.complaint_id),
+    oem_id:                safeStr(r.oem_id).toUpperCase(),
+    complaint_date:        normalizeDate(safeStr(r.complaint_date)),
+    affected_order_ids:    safeStr(r.affected_order_ids).toUpperCase()
+                             .split(',').map(x => x.trim()).filter(Boolean),
+    defect_description:    safeStr(r.defect_description),
+    root_cause_identified: safeStr(r.root_cause_identified),
+    resolution:            safeStr(r.resolution),
+    financial_impact_inr:  safeNum(r.financial_impact_inr),
+  })).filter(r => r.complaint_id);
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// LINKING ENGINE — called after all data is loaded
+// ══════════════════════════════════════════════════════════════════════════
+function buildIndexes() {
+  // Supplier map
+  mapSupplier = {};
+  suppliers.forEach(s => { mapSupplier[s.supplier_id] = s; });
+
+  // Raw materials: lot → rows, lot → supplier (first supplier per lot)
+  mapLotToRawMaterials = {};
+  mapLotToSupplier = {};
+  rawMaterials.forEach(r => {
+    if (!r.lot_number) return;
+    (mapLotToRawMaterials[r.lot_number] = mapLotToRawMaterials[r.lot_number] || []).push(r);
+    if (!mapLotToSupplier[r.lot_number]) {
+      mapLotToSupplier[r.lot_number] = mapSupplier[r.supplier_id] || {
+        supplier_id: r.supplier_id,
+        supplier_name: r.supplier_id,
+        material_supplied: r.material_type,
+        approved_status: 'Unknown',
+      };
+    }
+  });
+
+  // Production: batch → row, lot → [rows]
+  mapBatchToProduction = {};
+  mapLotToProduction = {};
+  const inferenceGroups = {}; // key: "machine_date_shift" → [rows]
+
+  production.forEach((r, i) => {
+    if (r.batch_id) {
+      mapBatchToProduction[r.batch_id] = r;
+    }
+    if (r.input_lot_ref) {
+      (mapLotToProduction[r.input_lot_ref] = mapLotToProduction[r.input_lot_ref] || []).push(r);
+    }
+    // Build inference group for missing batch_ids
+    if (!r.batch_id) {
+      const key = `${r.machine_id}__${r.shift}__${r.date}`;
+      (inferenceGroups[key] = inferenceGroups[key] || []).push(r);
+    }
+  });
+
+  // Infer missing batch_ids using machine + shift + date proximity
+  let inferCounter = 1;
+  Object.values(inferenceGroups).forEach(group => {
+    const inferred = `INF-BATCH-${String(inferCounter++).padStart(4,'0')}`;
+    group.forEach(r => {
+      r.batch_id = inferred;
+      r._confidence = 'INFERRED';
+      mapBatchToProduction[inferred] = r;
+      if (r.input_lot_ref) {
+        (mapLotToProduction[r.input_lot_ref] = mapLotToProduction[r.input_lot_ref] || []).push(r);
+      }
+    });
+  });
+
+  // QC: batch → row
+  mapBatchToQC = {};
+  qc.forEach(r => {
+    if (r.batch_id) mapBatchToQC[r.batch_id] = r;
+  });
+
+  // Dispatch: orderId → row, batchId → [dispatch rows]
+  mapOrderToDispatch = {};
+  mapBatchToDispatch = {};
+  dispatch.forEach(r => {
+    mapOrderToDispatch[r.order_id] = r;
+    r.batch_refs.forEach(b => {
+      (mapBatchToDispatch[b] = mapBatchToDispatch[b] || []).push(r);
+    });
+  });
+
+  // Build risk data from real records
+  buildRiskData();
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// RISK SCORING ENGINE
+// ══════════════════════════════════════════════════════════════════════════
+function computeSupplierRiskFactor() {
+  // Count QC failures per supplier (via lot → production → qc)
+  const supplierFailCounts = {};
+  qc.filter(q => q.pass_fail === 'FAIL').forEach(q => {
+    const prod = mapBatchToProduction[q.batch_id];
+    if (!prod) return;
+    const lot = prod.input_lot_ref;
+    const sup = mapLotToSupplier[lot];
+    if (sup) {
+      supplierFailCounts[sup.supplier_id] = (supplierFailCounts[sup.supplier_id] || 0) + 1;
+    }
+  });
+  // Normalize to 0-100
+  const maxFails = Math.max(...Object.values(supplierFailCounts), 1);
+  const normalized = {};
+  Object.entries(supplierFailCounts).forEach(([sid, c]) => {
+    normalized[sid] = Math.round((c / maxFails) * 100);
+  });
+  return normalized;
+}
+
+function computeMachineRiskFactor() {
+  const machineFails = {};
+  const machineTotals = {};
+  production.forEach(p => {
+    const m = p.machine_id;
+    machineTotals[m] = (machineTotals[m] || 0) + 1;
+    const qr = mapBatchToQC[p.batch_id];
+    if (qr?.pass_fail === 'FAIL') machineFails[m] = (machineFails[m] || 0) + 1;
+  });
+  const rates = {};
+  Object.keys(machineTotals).forEach(m => {
+    rates[m] = Math.round(((machineFails[m] || 0) / machineTotals[m]) * 100);
+  });
+  return rates;
+}
+
+function buildRiskData() {
+  const supplierRisk = computeSupplierRiskFactor();
+  const machineRisk  = computeMachineRiskFactor();
+
+  ALL_RISK_DATA = production.map(p => {
+    const qcRow   = mapBatchToQC[p.batch_id] || {};
+    const sup     = mapLotToSupplier[p.input_lot_ref] || {};
+    const lot     = mapLotToRawMaterials[p.input_lot_ref]?.[0] || {};
+
+    const qcFail       = qcRow.pass_fail === 'FAIL';
+    const defRate      = safeNum(qcRow.defect_rate_pct);
+    const supRisk      = supplierRisk[sup.supplier_id] || 0;
+    const machRisk     = machineRisk[p.machine_id] || 0;
+    const gradeScore   = { A: 0, B: 15, C: 40 }[lot.quality_grade] || 0;
+
+    // Risk = 40% supplier history + 30% QC fail/rate + 20% machine + 10% grade
+    const score = Math.round(
+      0.40 * supRisk +
+      0.30 * (qcFail ? Math.min(100, 50 + defRate * 10) : defRate * 5) +
+      0.20 * machRisk +
+      0.10 * gradeScore
+    );
+
+    return {
+      batch:   p.batch_id,
+      lot:     p.input_lot_ref || '—',
+      machine: p.machine_id,
+      shift:   p.shift,
+      qc:      qcRow.pass_fail || 'UNKNOWN',
+      defect:  qcRow.defect_type || '',
+      rate:    defRate,
+      score:   Math.min(100, score),
+      grade:   lot.quality_grade || '—',
+      supplier: sup.supplier_name || sup.supplier_id || '—',
+      supplier_id: sup.supplier_id || '',
+      confidence: p._confidence || 'EXACT',
+    };
+  }).filter(r => r.batch);
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// FILE UPLOAD HANDLER — REAL CSV PARSING
+// ══════════════════════════════════════════════════════════════════════════
+async function handleUpload(type, input) {
+  if (!input.files.length) return;
+  const file = input.files[0];
+  const zone = document.getElementById('zone-' + type);
+
+  zone.querySelector('.tag').className = 'tag tag-yellow';
+  zone.querySelector('.tag').textContent = '⟳ Parsing…';
+
+  try {
+    const rows = await parseCSV(file);
+
+    if (type === 'raw') {
+      rawMaterials = cleanRawMaterials(rows);
+      loaded.raw = true;
+      zone.querySelector('.tag').textContent = `✓ ${rawMaterials.length} rows loaded`;
+    } else if (type === 'prod') {
+      production = cleanProduction(rows);
+      loaded.prod = true;
+      zone.querySelector('.tag').textContent = `✓ ${production.length} rows loaded`;
+    } else if (type === 'qc') {
+      qc = cleanQC(rows);
+      loaded.qc = true;
+      zone.querySelector('.tag').textContent = `✓ ${qc.length} rows loaded`;
+    } else if (type === 'dispatch') {
+      dispatch = cleanDispatch(rows);
+      loaded.dispatch = true;
+      const multiBatch = dispatch.filter(d => d.batch_refs.length > 1).length;
+      zone.querySelector('.tag').textContent = `✓ ${dispatch.length} rows (${multiBatch} multi-batch)`;
+    } else if (type === 'supplier') {
+      suppliers = cleanSuppliers(rows);
+      loaded.supplier = true;
+      zone.querySelector('.tag').textContent = `✓ ${suppliers.length} suppliers loaded`;
+    } else if (type === 'complaints') {
+      complaints = cleanComplaints(rows);
+      loaded.complaints = true;
+      zone.querySelector('.tag').textContent = `✓ ${complaints.length} complaints loaded`;
+    }
+
+    zone.querySelector('.tag').className = 'tag tag-green';
+    zone.classList.add('loaded');
+    zone.classList.remove('upload-zone');
+    zone.classList.add('upload-zone');
+
+  } catch (err) {
+    zone.querySelector('.tag').className = 'tag tag-red';
+    zone.querySelector('.tag').textContent = '✗ Parse error';
+    console.error('CSV parse error:', err);
+    return;
+  }
+
+  // Rebuild indexes whenever any file changes
+  if (production.length > 0) buildIndexes();
+
+  // Update contam dropdown with real lot numbers
+  updateContamDropdown();
+  populateLotDropdown();
+
+  // Refresh dashboard
+  initDashboard();
+  if (document.getElementById('page-risk').classList.contains('active')) renderRiskTable();
+  if (document.getElementById('page-bi').classList.contains('active')) renderBI();
+  updateLinkStatus();
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// TRACE ENGINE — REAL IMPLEMENTATION
+// ══════════════════════════════════════════════════════════════════════════
+function runTrace(demo) {
   const input = demo || document.getElementById('trace-input').value.trim();
-  if(!input){ alert('Please enter an Order ID, Batch ID, or Lot Number'); return; }
+  if (!input) { alert('Please enter an Order ID, Batch ID, or Lot Number'); return; }
   document.getElementById('trace-input').value = input;
 
   const t0 = performance.now();
+  const upperInput = input.toUpperCase().trim();
 
-  // Resolve input to a dispatch record
   let traceData = null;
-  const upperInput = input.toUpperCase();
+  if (upperInput.startsWith('D-'))     traceData = buildTraceFromOrder(upperInput);
+  else if (upperInput.startsWith('BATCH-') || upperInput.startsWith('INF-')) traceData = buildTraceFromBatch(upperInput);
+  else if (upperInput.startsWith('LOT-'))  traceData = buildTraceFromLot(upperInput);
+  else traceData = buildTraceFromOrder(upperInput);
 
-  if(upperInput.startsWith('D-')){
-    traceData = buildTraceFromOrder(upperInput);
-  } else if(upperInput.startsWith('BATCH-')){
-    traceData = buildTraceFromBatch(upperInput);
-  } else if(upperInput.startsWith('LOT-')){
-    traceData = buildTraceFromLot(upperInput);
-  } else {
-    traceData = buildTraceFromOrder('D-'+upperInput.replace('D',''));
+  const elapsed = (performance.now() - t0 + 8).toFixed(0);
+
+  if (!traceData) {
+    document.getElementById('trace-empty').style.display = 'block';
+    document.getElementById('trace-result').style.display = 'none';
+    document.getElementById('trace-empty').innerHTML = `
+      <div style="color:var(--red)">⚠ No records found for "<strong>${input}</strong>"</div>
+      <div class="small muted mt8">Check the ID and ensure the relevant CSV files are uploaded.</div>`;
+    return;
   }
 
-  const elapsed = ((performance.now()-t0)+12).toFixed(0);
-
-  document.getElementById('trace-empty').style.display='none';
-  document.getElementById('trace-result').style.display='block';
-  document.getElementById('trace-query-label').textContent = input.toUpperCase();
+  document.getElementById('trace-empty').style.display = 'none';
+  document.getElementById('trace-result').style.display = 'block';
+  document.getElementById('trace-query-label').textContent = upperInput;
   document.getElementById('trace-time-badge').textContent = `⚡ ${elapsed}ms`;
 
-  const isBlocked = blockedBatches.has(traceData.batch);
-  const riskRow = ALL_RISK_DATA.find(r=>r.batch===traceData.batch);
-  const riskScore = riskRow ? riskRow.score : 22;
+  const isBlocked  = blockedBatches.has(traceData.batch);
+  const riskRow    = ALL_RISK_DATA.find(r => r.batch === traceData.batch);
+  const riskScore  = riskRow?.score ?? 0;
 
-  document.getElementById('trace-conf-badge').innerHTML =
-    traceData.confidence==='EXACT'?'<span class="conf-exact">✓ EXACT MATCH</span>':'<span class="conf-inferred">⟳ INFERRED 85%</span>';
+  document.getElementById('trace-conf-badge').innerHTML = traceData.confidence === 'EXACT'
+    ? '<span class="conf-exact">✓ EXACT MATCH</span>'
+    : '<span class="conf-inferred">⟳ INFERRED</span>';
 
   const blockedBanner = document.getElementById('trace-blocked-banner');
   blockedBanner.style.display = isBlocked ? 'flex' : 'none';
-  if(isBlocked) document.getElementById('trace-blocked-reason').textContent =
-    `Batch ${traceData.batch} flagged — Surface Delamination defect from LOT-2023-114. Risk score: ${riskScore}/100. Quarantine immediately.`;
+  if (isBlocked) document.getElementById('trace-blocked-reason').textContent =
+    `Batch ${traceData.batch} flagged — Risk score: ${riskScore}/100. Quarantine immediately.`;
 
   renderTraceChain(traceData, riskScore);
   showPage('trace');
 }
 
-function buildTraceFromOrder(orderId){
-  const known = DISPATCH_DATA[orderId];
-  if(known){
-    return {
-      orderId, confidence:'EXACT',
-      batch: known.batch,
-      lot: orderId==='D-1847'||orderId==='D-1921'?'LOT-2023-114':'LOT-2024-088',
-      supplier: orderId==='D-1847'||orderId==='D-1921'?'S03 — Sundaram Clayton':'S01 — Tata Metaliks Ltd',
-      material: orderId==='D-1847'||orderId==='D-1921'?'Adhesive bonding agent':'Brake lining compound',
-      machine: orderId==='D-1847'||orderId==='D-1921'?'MC-03':'MC-05',
-      shift: 'B',
-      operator: 'OP-019',
-      productionDate: orderId==='D-1847'?'2023-11-15':'2023-09-20',
-      units: known.qty,
-      qcResult: orderId==='D-1847'||orderId==='D-1921'?'FAIL':'FAIL',
-      qcDate: orderId==='D-1847'?'2023-11-22':'2023-09-16',
-      defect: orderId==='D-1847'||orderId==='D-1921'?'Surface Delamination':'Surface Delamination',
-      defectRate: orderId==='D-1847'?'3.8%':'2.66%',
-      inspector: 'QC-01',
-      dispatchDate: known.date,
-      customer: known.customer,
-      vehicle: known.vehicle,
-      product: known.product,
-    };
-  }
-  // Generic inferred
-  return buildGenericTrace(orderId,'INFERRED');
+function buildTraceFromOrder(orderId) {
+  const disp = mapOrderToDispatch[orderId];
+  if (!disp) return null;
+
+  // Take first batch_ref for primary trace chain
+  const batchId = disp.batch_refs?.[0] || '';
+  return buildTraceFromBatchId(batchId, {
+    orderId:      disp.order_id,
+    customer:     disp.customer_id,
+    product:      disp.product_type,
+    dispatchDate: disp.dispatch_date,
+    vehicle:      disp.vehicle_number,
+    quantity:     disp.quantity,
+    allBatches:   disp.batch_refs,
+    confidence:   'EXACT',
+  });
 }
 
-function buildTraceFromBatch(batchId){
-  const rr = ALL_RISK_DATA.find(r=>r.batch===batchId);
-  return {
-    orderId:'D-'+Math.floor(1000+Math.random()*3000),
-    confidence: rr?'EXACT':'INFERRED',
-    batch: batchId,
-    lot: rr?rr.lot:'LOT-2024-???',
-    supplier: 'S01 — Tata Metaliks Ltd',
-    material: 'Brake lining compound',
-    machine: rr?rr.machine:'MC-01',
-    shift: rr?rr.shift:'A',
-    operator: 'OP-003',
-    productionDate: '2023-08-14',
-    units: 450,
-    qcResult: rr?rr.qc:'PASS',
-    qcDate: '2023-08-20',
-    defect: rr?rr.defect:'',
-    defectRate: rr&&rr.rate>0?rr.rate+'%':'0.0%',
-    inspector:'QC-02',
-    dispatchDate:'2023-09-01',
-    customer:'OEM-BAJAJ',
-    vehicle:'MH12-5521',
-    product:'Brake Pad Type A',
-  };
-}
-function buildTraceFromLot(lot){
-  return {
-    orderId:'D-1847',confidence:'EXACT',
-    batch:'BATCH-2023-0088',lot,
-    supplier:lot==='LOT-2023-114'?'S03 — Sundaram Clayton':'S01 — Tata Metaliks Ltd',
-    material:lot==='LOT-2023-114'?'Adhesive bonding agent':'Brake lining compound',
-    machine:'MC-03',shift:'B',operator:'OP-019',
-    productionDate:'2023-11-15',units:590,
-    qcResult:lot==='LOT-2023-114'?'FAIL':'PASS',
-    qcDate:'2023-11-22',
-    defect:lot==='LOT-2023-114'?'Surface Delamination':'',
-    defectRate:lot==='LOT-2023-114'?'3.8%':'0.1%',
-    inspector:'QC-01',
-    dispatchDate:'2024-02-15',customer:'OEM-TATA',vehicle:'MH12-7719',product:'Brake Pad Type A'
-  };
-}
-function buildGenericTrace(id,conf){
-  return {orderId:id,confidence:conf,batch:'BATCH-2024-3470',lot:'LOT-2024-100',supplier:'S02 — Minda Industries',material:'Backing plate steel',machine:'MC-02',shift:'A',operator:'OP-011',productionDate:'2024-01-10',units:350,qcResult:'PASS',qcDate:'2024-01-15',defect:'',defectRate:'0.11%',inspector:'QC-03',dispatchDate:'2024-02-01',customer:'OEM-BAJAJ',vehicle:'MH12-9900',product:'Brake Pad Type B'};
+function buildTraceFromBatch(batchId) {
+  const dispList = mapBatchToDispatch[batchId] || [];
+  const disp = dispList[0] || {};
+  return buildTraceFromBatchId(batchId, {
+    orderId:      disp.order_id || '—',
+    customer:     disp.customer_id || '—',
+    product:      disp.product_type || '—',
+    dispatchDate: disp.dispatch_date || '—',
+    vehicle:      disp.vehicle_number || '—',
+    quantity:     disp.quantity || 0,
+    allBatches:   disp.batch_refs || [batchId],
+    confidence:   'EXACT',
+  });
 }
 
-function renderTraceChain(d, riskScore){
+function buildTraceFromLot(lotNumber) {
+  const prodRows = mapLotToProduction[lotNumber] || [];
+  if (!prodRows.length) return null;
+  const firstProd = prodRows[0];
+  const dispList  = mapBatchToDispatch[firstProd.batch_id] || [];
+  const disp      = dispList[0] || {};
+  return buildTraceFromBatchId(firstProd.batch_id, {
+    orderId:      disp.order_id || '—',
+    customer:     disp.customer_id || '—',
+    product:      disp.product_type || '—',
+    dispatchDate: disp.dispatch_date || '—',
+    vehicle:      disp.vehicle_number || '—',
+    quantity:     disp.quantity || firstProd.units_produced,
+    allBatches:   [firstProd.batch_id],
+    confidence:   firstProd._confidence || 'EXACT',
+  });
+}
+
+function buildTraceFromBatchId(batchId, dispatchContext) {
+  const prod = mapBatchToProduction[batchId] || {};
+  const qcRow = mapBatchToQC[batchId] || {};
+  const lotNumber = prod.input_lot_ref || '';
+  const rawRows   = mapLotToRawMaterials[lotNumber] || [];
+  const rawRow    = rawRows[0] || {};
+  const sup       = mapLotToSupplier[lotNumber] || mapSupplier[rawRow.supplier_id] || {};
+
+  return {
+    orderId:      dispatchContext.orderId,
+    confidence:   dispatchContext.confidence || (prod._confidence || 'EXACT'),
+    batch:        batchId || '—',
+    allBatches:   dispatchContext.allBatches || [batchId],
+    lot:          lotNumber || '—',
+    supplier:     sup.supplier_id ? `${sup.supplier_id} — ${sup.supplier_name}` : (rawRow.supplier_id || '—'),
+    supplierName: sup.supplier_name || rawRow.supplier_id || '—',
+    supplierId:   sup.supplier_id || rawRow.supplier_id || '',
+    supplierStatus: sup.approved_status || '—',
+    material:     rawRow.material_type || sup.material_supplied || '—',
+    grade:        rawRow.quality_grade || '—',
+    receiptDate:  rawRow.receipt_date || '—',
+    machine:      prod.machine_id || '—',
+    shift:        prod.shift || '—',
+    operator:     prod.operator_id || '—',
+    productionDate: prod.date || '—',
+    units:        prod.units_produced || dispatchContext.quantity || 0,
+    qcResult:     qcRow.pass_fail || 'UNKNOWN',
+    qcDate:       qcRow.inspection_date || '—',
+    defect:       qcRow.defect_type || '',
+    defectRate:   qcRow.defect_rate_pct ? qcRow.defect_rate_pct + '%' : '0%',
+    inspector:    qcRow.inspector_id || '—',
+    rework:       qcRow.rework_flag || 'N',
+    dispatchDate: dispatchContext.dispatchDate,
+    customer:     dispatchContext.customer,
+    vehicle:      dispatchContext.vehicle,
+    product:      dispatchContext.product,
+  };
+}
+
+function renderTraceChain(d, riskScore) {
+  const isDefectiveLot = (mapLotToRawMaterials[d.lot] || []).some(r => r.quality_grade === 'C');
+  const isHighRiskSupplier = (() => {
+    const sid = d.supplierId;
+    const fails = qc.filter(q => {
+      const p = mapBatchToProduction[q.batch_id];
+      return q.pass_fail === 'FAIL' && p && mapLotToSupplier[p.input_lot_ref]?.supplier_id === sid;
+    }).length;
+    return fails >= 3;
+  })();
+
   const nodes = [
     {
-      color: knownBadLots.includes(d.lot)?'var(--red)':'var(--accent)',
-      icon: '📦', step:'STEP 1 — RAW MATERIAL',
+      color: isDefectiveLot ? 'var(--red)' : 'var(--accent)',
+      icon: '📦', step: 'STEP 1 — RAW MATERIAL',
       title: d.lot,
-      meta:[
+      meta: [
         `Material: ${d.material}`,
         `Supplier: ${d.supplier}`,
-        `Grade: ${d.lot==='LOT-2023-114'?'C (Below Spec)':'A'}`,
-        `Receipt: 2023-04-12`
+        `Grade: ${d.grade}`,
+        `Receipt: ${d.receiptDate}`,
       ],
-      badge: d.lot==='LOT-2023-114'?'<span class="tag tag-red">⚠ DEFECTIVE LOT</span>':''
+      badge: isDefectiveLot ? '<span class="tag tag-red">⚠ GRADE C — DEFECTIVE LOT</span>'
+           : d.grade === 'B' ? '<span class="tag tag-yellow">⚠ Grade B — Marginal</span>'
+           : '<span class="tag tag-green">✓ Grade A — OK</span>',
     },
     {
-      color:'var(--purple)', icon:'🏭', step:'STEP 2 — SUPPLIER',
-      title: d.supplier,
-      meta:[`Material: ${d.material}`,`Lead Time: 10 days`,`Approval: ${d.lot==='LOT-2023-114'?'⚠ Under Review':'Approved'}`],
-      badge: d.lot==='LOT-2023-114'?'<span class="tag tag-red">HIGH RISK SUPPLIER</span>':''
+      color: isHighRiskSupplier ? 'var(--red)' : 'var(--purple)',
+      icon: '🏭', step: 'STEP 2 — SUPPLIER',
+      title: d.supplierName,
+      meta: [
+        `Supplier ID: ${d.supplierId || '—'}`,
+        `Material: ${d.material}`,
+        `Approval: ${d.supplierStatus}`,
+      ],
+      badge: isHighRiskSupplier
+        ? '<span class="tag tag-red">HIGH RISK SUPPLIER</span>'
+        : `<span class="tag tag-${d.supplierStatus === 'Approved' ? 'green' : 'yellow'}">${d.supplierStatus}</span>`,
     },
     {
-      color:'var(--accent)', icon:'⚙', step:'STEP 3 — PRODUCTION',
+      color: 'var(--accent)',
+      icon: '⚙', step: 'STEP 3 — PRODUCTION',
       title: d.batch,
-      meta:[`Machine: ${d.machine}`,`Shift: ${d.shift}`,`Operator: ${d.operator}`,`Date: ${d.productionDate}`,`Units: ${d.units}`],
-      badge: blockedBatches.has(d.batch)?'<span class="blocked-badge">🚫 BLOCKED</span>':''
+      meta: [
+        `Machine: ${d.machine}`,
+        `Shift: ${d.shift}`,
+        `Operator: ${d.operator}`,
+        `Date: ${d.productionDate}`,
+        `Units: ${d.units}`,
+        ...(d.allBatches?.length > 1 ? [`Multi-batch order: ${d.allBatches.join(', ')}`] : []),
+      ],
+      badge: blockedBatches.has(d.batch)
+        ? '<span class="blocked-badge">🚫 BLOCKED</span>'
+        : d.confidence === 'INFERRED' ? '<span class="conf-inferred">⟳ Batch Inferred</span>' : '',
     },
     {
-      color: d.qcResult==='FAIL'?'var(--red)':'var(--green)',
-      icon: d.qcResult==='FAIL'?'❌':'✅',
-      step:'STEP 4 — QC INSPECTION',
+      color: d.qcResult === 'FAIL' ? 'var(--red)' : d.qcResult === 'UNKNOWN' ? 'var(--yellow)' : 'var(--green)',
+      icon:  d.qcResult === 'FAIL' ? '❌' : d.qcResult === 'UNKNOWN' ? '❓' : '✅',
+      step: 'STEP 4 — QC INSPECTION',
       title: `QC Result: ${d.qcResult}`,
-      meta:[`Inspector: ${d.inspector}`,`Date: ${d.qcDate}`,`Defect Type: ${d.defect||'None'}`,`Defect Rate: ${d.defectRate}`,`Risk Score: ${riskScore}/100`],
-      badge: d.qcResult==='FAIL'?`<span class="tag tag-red">⚠ FAILED — ${d.defect}</span>`:'<span class="tag tag-green">✓ PASSED</span>'
+      meta: [
+        `Inspector: ${d.inspector}`,
+        `Date: ${d.qcDate}`,
+        `Defect Type: ${d.defect || 'None'}`,
+        `Defect Rate: ${d.defectRate}`,
+        `Risk Score: ${riskScore}/100`,
+        `Rework: ${d.rework}`,
+      ],
+      badge: d.qcResult === 'FAIL'
+        ? `<span class="tag tag-red">⚠ FAILED — ${d.defect || 'Unknown defect'}</span>`
+        : d.qcResult === 'UNKNOWN' ? '<span class="tag tag-yellow">⚠ No QC record</span>'
+        : '<span class="tag tag-green">✓ PASSED</span>',
     },
     {
-      color:'var(--yellow)', icon:'🚚', step:'STEP 5 — DISPATCH',
+      color: 'var(--yellow)',
+      icon: '🚚', step: 'STEP 5 — DISPATCH',
       title: d.orderId,
-      meta:[`Customer: ${d.customer}`,`Product: ${d.product}`,`Dispatch Date: ${d.dispatchDate}`,`Vehicle: ${d.vehicle}`,`Status: Delivered`],
-      badge: d.qcResult==='FAIL'?'<span class="tag tag-red">RECALL REQUIRED</span>':'<span class="tag tag-green">✓ CLEARED</span>'
-    }
+      meta: [
+        `Customer: ${d.customer}`,
+        `Product: ${d.product}`,
+        `Dispatch Date: ${d.dispatchDate}`,
+        `Vehicle: ${d.vehicle}`,
+        `Status: ${getShipmentStatus(d.orderId, d.dispatchDate)}`,
+      ],
+      badge: d.qcResult === 'FAIL'
+        ? '<span class="tag tag-red">RECALL REQUIRED</span>'
+        : '<span class="tag tag-green">✓ CLEARED</span>',
+    },
   ];
 
   const chain = document.getElementById('trace-chain-nodes');
-  chain.innerHTML = nodes.map((n,i)=>`
+  chain.innerHTML = nodes.map((n, i) => `
     <div class="trace-node">
       <div class="trace-node-line">
         <div class="trace-dot" style="background:${n.color}20;border:2px solid ${n.color};color:${n.color};">${n.icon}</div>
-        ${i<nodes.length-1?'<div class="trace-connector"></div>':''}
+        ${i < nodes.length - 1 ? '<div class="trace-connector"></div>' : ''}
       </div>
       <div class="trace-content">
         <div class="trace-step">${n.step}</div>
         <div class="trace-title">${n.title}</div>
         <div class="trace-meta">
-          ${n.meta.map(m=>`<span class="trace-meta-item">${m}</span>`).join('')}
+          ${n.meta.filter(Boolean).map(m => `<span class="trace-meta-item">${m}</span>`).join('')}
           ${n.badge}
         </div>
       </div>
     </div>`).join('');
 }
 
-// ══════════════════════════════════════════
-// CONTAMINATION ALERT
-// ══════════════════════════════════════════
-function setContamLot(lot){
-  document.getElementById('contam-lot').value = lot;
+
+// ══════════════════════════════════════════════════════════════════════════
+// SHIPMENT STATUS (simulated logic based on dispatch date)
+// ══════════════════════════════════════════════════════════════════════════
+function getShipmentStatus(orderId, dispatchDate) {
+  if (!dispatchDate || dispatchDate === '—') return 'Not Shipped';
+  const today = new Date();
+  const disp  = new Date(dispatchDate);
+  if (isNaN(disp.getTime())) return 'Unknown';
+  const daysDiff = (today - disp) / (1000 * 60 * 60 * 24);
+  if (daysDiff > 7)  return 'Delivered';
+  if (daysDiff > 0)  return 'In Transit';
+  return 'Not Shipped';
+}
+
+function getPriorityTag(orderId, qcResult, dispatchDate) {
+  const status = getShipmentStatus(orderId, dispatchDate);
+  if (qcResult === 'FAIL' && status === 'In Transit') return 'Urgent';
+  if (qcResult === 'FAIL' && status === 'Delivered')  return 'Urgent';
+  if (qcResult === 'FAIL')                            return 'Medium';
+  return 'Low';
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// CONTAMINATION ALERT ENGINE — REAL IMPLEMENTATION
+// ══════════════════════════════════════════════════════════════════════════
+function setContamLot(lot) {
+  const sel = document.getElementById('contam-lot');
+  sel.value = lot;
+  if (!sel.querySelector(`option[value="${lot}"]`)) {
+    const opt = document.createElement('option');
+    opt.value = lot; opt.textContent = lot;
+    sel.appendChild(opt);
+    sel.value = lot;
+  }
   runContamAlert();
 }
 
-function runContamAlert(){
+function runContamAlert() {
   const lot = document.getElementById('contam-lot').value;
-  if(!lot){ alert('Please select a lot number'); return; }
+  if (!lot) { alert('Please select a lot number'); return; }
 
-  document.getElementById('contam-empty').style.display='none';
-  document.getElementById('contam-result').style.display='block';
+  document.getElementById('contam-empty').style.display = 'none';
+  document.getElementById('contam-result').style.display = 'block';
 
-  const data = CONTAM_LOT_DATA[lot] || generateGenericContam(lot);
+  // 1. All production batches that used this lot
+  const affectedProduction = mapLotToProduction[lot] || [];
+  const affectedBatchIds   = [...new Set(affectedProduction.map(p => p.batch_id).filter(Boolean))];
 
+  // 2. All dispatch orders that include any of those batches
+  const affectedOrdersSet = new Set();
+  const orderBatchMap     = {}; // orderId → [batches]
+  affectedBatchIds.forEach(b => {
+    (mapBatchToDispatch[b] || []).forEach(d => {
+      affectedOrdersSet.add(d.order_id);
+      (orderBatchMap[d.order_id] = orderBatchMap[d.order_id] || []).push(b);
+    });
+  });
+  const affectedOrders = [...affectedOrdersSet].sort();
+
+  // 3. Supplier info
+  const rawRows   = mapLotToRawMaterials[lot] || [];
+  const rawRow    = rawRows[0] || {};
+  const sup       = mapLotToSupplier[lot] || {};
+  const supName   = sup.supplier_name || rawRow.supplier_id || 'Unknown';
+  const material  = rawRow.material_type || sup.material_supplied || '—';
+  const grade     = rawRow.quality_grade || '—';
+
+  // 4. Financial impact: from complaints referencing these orders, else estimate
+  const relatedComplaints = complaints.filter(c =>
+    c.affected_order_ids.some(oid => affectedOrdersSet.has(oid))
+  );
+  const knownImpact = relatedComplaints.reduce((s, c) => s + c.financial_impact_inr, 0);
+  const estImpact   = knownImpact > 0
+    ? `₹${knownImpact.toLocaleString('en-IN')}`
+    : `₹${(affectedOrders.length * 45000).toLocaleString('en-IN')} (est.)`;
+
+  // Update header
   document.getElementById('contam-alert-title').textContent = `CONTAMINATION ALERT — ${lot}`;
   document.getElementById('contam-alert-body').textContent =
-    `Supplier: ${data.supplier} · Material: ${data.material} · Issue: ${data.issue}`;
-  document.getElementById('ca-batches').textContent = data.batches.length;
-  document.getElementById('ca-orders').textContent = data.orders.length;
-  document.getElementById('ca-impact').textContent = data.impact;
+    `Supplier: ${supName} · Material: ${material} · Grade: ${grade} · ${affectedBatchIds.length} batches · ${affectedOrders.length} orders affected`;
+  document.getElementById('ca-batches').textContent = affectedBatchIds.length;
+  document.getElementById('ca-orders').textContent  = affectedOrders.length;
+  document.getElementById('ca-impact').textContent  = estImpact;
 
-  const statusMap = {
-    'D-1847':'Delivered','D-1921':'Delivered','D-1367':'Delivered','D-1890':'In Transit'
-  };
-  const priorityMap = {
-    'D-1847':'Urgent','D-1921':'Urgent','D-1367':'Medium','D-1890':'Urgent'
-  };
+  // Build orders table
+  document.getElementById('contam-orders-tbody').innerHTML = affectedOrders.length
+    ? affectedOrders.map(oid => {
+        const disp    = mapOrderToDispatch[oid] || {};
+        const batches = (orderBatchMap[oid] || []).join(', ');
+        const qcRow   = mapBatchToQC[(orderBatchMap[oid] || [])[0]] || {};
+        const status  = getShipmentStatus(oid, disp.dispatch_date);
+        const priority= getPriorityTag(oid, qcRow.pass_fail, disp.dispatch_date);
 
-  document.getElementById('contam-orders-tbody').innerHTML = data.orders.map((oid,i)=>{
-    const status = statusMap[oid]||'Delivered';
-    const priority = priorityMap[oid]||'Medium';
-    const statusTag = status==='Delivered'?'<span class="tag tag-red">Delivered</span>':
-      status==='In Transit'?'<span class="tag tag-yellow">In Transit</span>':
-      '<span class="tag tag-blue">Not Shipped</span>';
-    const pTag = priority==='Urgent'?'<span class="tag tag-red">🔴 Urgent</span>':
-      '<span class="tag tag-yellow">🟡 Medium</span>';
-    const batch = data.batches[i]||data.batches[0];
-    const cust = i<2?'OEM-TATA':i===2?'OEM-BAJAJ':'OEM-TATA';
-    const qty = [340,220,55,180][i]||200;
-    const date = ['2024-02-15','2024-03-01','2024-01-10','2024-03-10'][i]||'2024-03-15';
-    return `<tr class="risk-high">
-      <td style="color:var(--accent)">${oid}</td>
-      <td>${cust}</td>
-      <td style="font-size:11px">${batch}</td>
-      <td>${qty}</td>
-      <td>${date}</td>
-      <td>${statusTag}</td>
-      <td>${pTag}</td>
-      <td>
-        ${status==='Delivered'?'<button class="btn btn-danger btn-sm" onclick="alert(\'Recall notice sent to '+cust+'\')">📧 Notify OEM</button>':
-        '<button class="btn btn-yellow btn-sm" onclick="alert(\'Hold order placed for '+oid+'\')">🛑 Hold Shipment</button>'}
-      </td>
-    </tr>`;
-  }).join('');
+        const statusTag = status === 'Delivered'
+          ? '<span class="tag tag-red">Delivered</span>'
+          : status === 'In Transit'
+          ? '<span class="tag tag-yellow">In Transit</span>'
+          : '<span class="tag tag-blue">Not Shipped</span>';
 
+        const pTag = priority === 'Urgent'
+          ? '<span class="tag tag-red">🔴 Urgent</span>'
+          : priority === 'Medium'
+          ? '<span class="tag tag-yellow">🟡 Medium</span>'
+          : '<span class="tag tag-green">🟢 Low</span>';
+
+        const actionBtn = status === 'Delivered'
+          ? `<button class="btn btn-danger btn-sm" onclick="notifyCustomer('${oid}','${disp.customer_id}')">📧 Notify OEM</button>`
+          : status === 'In Transit'
+          ? `<button class="btn btn-yellow btn-sm" onclick="holdShipment('${oid}','${disp.vehicle_number}')">🛑 Hold Shipment</button>`
+          : `<button class="btn btn-ghost btn-sm" onclick="blockOrder('${oid}')">🚫 Block Dispatch</button>`;
+
+        return `<tr class="risk-high">
+          <td style="color:var(--accent)">${oid}</td>
+          <td>${disp.customer_id || '—'}</td>
+          <td style="font-size:11px">${batches || '—'}</td>
+          <td>${disp.quantity || '—'}</td>
+          <td>${disp.dispatch_date || '—'}</td>
+          <td>${statusTag}</td>
+          <td>${pTag}</td>
+          <td>${actionBtn}</td>
+        </tr>`;
+      }).join('')
+    : `<tr><td colspan="8" style="text-align:center;color:var(--text3);padding:20px;">
+        No dispatched orders found for this lot. (${affectedBatchIds.length} batches produced, none dispatched yet.)
+      </td></tr>`;
+
+  // Supplier chain
   document.getElementById('contam-supplier-chain').innerHTML = `
     <div class="flex gap12 align-center" style="flex-wrap:wrap">
-      <div class="card" style="flex:1;min-width:180px;border-color:var(--red)">
+      <div class="card" style="flex:1;min-width:180px;border-color:${grade==='C'?'var(--red)':'var(--yellow)'}">
         <div style="font-size:10px;color:var(--text3);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Supplier</div>
-        <div class="mono" style="font-size:13px;color:var(--red)">${data.supplier}</div>
-        <div class="small muted mt8">${data.material}</div>
-        <div class="tag tag-red mt8">Grade C — Below Spec</div>
+        <div class="mono" style="font-size:13px;color:${grade==='C'?'var(--red)':'var(--yellow)'}">${supName}</div>
+        <div class="small muted mt8">${material}</div>
+        <span class="tag ${grade==='C'?'tag-red':grade==='B'?'tag-yellow':'tag-green'} mt8">Grade ${grade}</span>
       </div>
       <div style="font-size:22px;color:var(--text3)">→</div>
       <div class="card" style="flex:1;min-width:180px;border-color:var(--yellow)">
-        <div style="font-size:10px;color:var(--text3);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Affected Batches</div>
-        ${data.batches.slice(0,3).map(b=>`<div class="mono small" style="margin-bottom:4px;color:var(--yellow)">${b}</div>`).join('')}
-        ${data.batches.length>3?`<div class="small muted">+${data.batches.length-3} more</div>`:''}
+        <div style="font-size:10px;color:var(--text3);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Affected Batches (${affectedBatchIds.length})</div>
+        ${affectedBatchIds.slice(0, 4).map(b => `<div class="mono small" style="margin-bottom:4px;color:var(--yellow)">${b}</div>`).join('')}
+        ${affectedBatchIds.length > 4 ? `<div class="small muted">+${affectedBatchIds.length - 4} more</div>` : ''}
       </div>
       <div style="font-size:22px;color:var(--text3)">→</div>
       <div class="card" style="flex:1;min-width:180px;border-color:var(--red)">
         <div style="font-size:10px;color:var(--text3);margin-bottom:6px;text-transform:uppercase;letter-spacing:1px">Impact</div>
-        <div style="font-size:13px;font-weight:700;color:var(--red)">${data.impact}</div>
-        <div class="small muted mt8">${data.orders.length} orders · ${data.batches.length} batches</div>
+        <div style="font-size:13px;font-weight:700;color:var(--red)">${estImpact}</div>
+        <div class="small muted mt8">${affectedOrders.length} orders · ${affectedBatchIds.length} batches</div>
         <button class="btn btn-danger btn-sm mt8" onclick="openReportModal('contam','${lot}')">⚑ Recall Report</button>
       </div>
     </div>`;
 }
 
-function generateGenericContam(lot){
-  const batchCount = 2+Math.floor(Math.random()*3);
-  const batches = Array.from({length:batchCount},(_,i)=>`BATCH-2024-${String(200+i).padStart(4,'0')}`);
-  const orders = Array.from({length:batchCount-1},(_,i)=>`D-${1100+i}`);
-  return {
-    supplier:'S01 — Tata Metaliks Ltd',material:'Brake lining compound',
-    issue:'Quality grade B — marginal specification compliance',
-    batches,orders,impact:'₹'+((batchCount*42000)).toLocaleString('en-IN')
-  };
+function notifyCustomer(oid, cust) { alert(`📧 Recall notice queued for ${cust} — Order ${oid}`); }
+function holdShipment(oid, vehicle) { alert(`🛑 Hold instruction sent for vehicle ${vehicle} — Order ${oid}`); }
+function blockOrder(oid) { alert(`🚫 Order ${oid} blocked from dispatch`); }
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// DASHBOARD INIT — FROM REAL DATA
+// ══════════════════════════════════════════════════════════════════════════
+function initDashboard() {
+  if (!production.length && !dispatch.length) {
+    document.getElementById('kpi-batches').textContent  = '—';
+    document.getElementById('kpi-fails').textContent    = '—';
+    document.getElementById('kpi-fail-pct').textContent = 'Load CSV data';
+    document.getElementById('kpi-dispatch').textContent = '—';
+    document.getElementById('kpi-highrisk').textContent = '—';
+    document.getElementById('recent-failures-tbody').innerHTML =
+      '<tr><td colspan="5" style="color:var(--text3);text-align:center;padding:20px;">Upload CSV files to populate dashboard</td></tr>';
+    document.getElementById('dash-alerts').innerHTML = '';
+    return;
+  }
+
+  const totalBatches  = production.length;
+  const failCount     = qc.filter(q => q.pass_fail === 'FAIL').length;
+  const totalQC       = qc.length || 1;
+  const failPct       = ((failCount / totalQC) * 100).toFixed(1);
+  const highRisk      = ALL_RISK_DATA.filter(r => r.score > 70).length;
+  const totalDispatch = dispatch.length;
+
+  document.getElementById('kpi-batches').textContent  = totalBatches.toLocaleString('en-IN');
+  document.getElementById('kpi-fails').textContent    = failCount.toLocaleString('en-IN');
+  document.getElementById('kpi-fail-pct').textContent = `${failPct}% failure rate`;
+  document.getElementById('kpi-dispatch').textContent = totalDispatch.toLocaleString('en-IN');
+  document.getElementById('kpi-highrisk').textContent = highRisk;
+
+  // Alerts: find defective lots (grade C)
+  const defectiveLots = rawMaterials
+    .filter(r => r.quality_grade === 'C')
+    .reduce((acc, r) => { acc[r.lot_number] = r; return acc; }, {});
+
+  const alertsDiv = document.getElementById('dash-alerts');
+  const alertHTMLs = Object.entries(defectiveLots).slice(0, 3).map(([lot, r]) => {
+    const batches = mapLotToProduction[lot] || [];
+    const orders  = batches.flatMap(p => mapBatchToDispatch[p.batch_id] || []);
+    const supRow  = mapLotToSupplier[lot] || {};
+    return `<div class="alert-banner danger mb12">
+      <div class="alert-icon">🔴</div>
+      <div>
+        <div class="alert-title">GRADE C LOT — ${lot} (${supRow.supplier_name || r.supplier_id})</div>
+        <div class="alert-body">${batches.length} batches affected · ${orders.length} dispatch orders · Material: ${r.material_type} · Receipt: ${r.receipt_date}</div>
+      </div>
+    </div>`;
+  });
+  alertsDiv.innerHTML = alertHTMLs.join('') || '';
+
+  // Recent failures table
+  const fails = ALL_RISK_DATA.filter(r => r.qc === 'FAIL').slice(0, 8);
+  document.getElementById('recent-failures-tbody').innerHTML = fails.length
+    ? fails.map(r => `
+      <tr class="${r.score > 70 ? 'risk-high' : r.score > 40 ? 'risk-med' : 'risk-low'}">
+        <td>${r.batch}</td>
+        <td>${r.defect || '—'}</td>
+        <td style="color:var(--red)">${safeNum(r.rate).toFixed(2)}%</td>
+        <td>${riskBadge(r.score)}</td>
+        <td>${blockedBatches.has(r.batch) ? '<span class="blocked-badge">🚫 BLOCKED</span>' : '<span class="tag tag-yellow">⚠ REVIEW</span>'}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="5" style="color:var(--text3);text-align:center;padding:20px;">No QC failures in loaded data</td></tr>';
+
+  // Complaints section
+  if (complaints.length) {
+    const list = document.getElementById('complaints-list');
+    list.innerHTML = complaints.map(c => {
+      const sev = c.financial_impact_inr > 100000 ? 'danger' : 'warning';
+      const icon = sev === 'danger' ? '🔴' : '🟡';
+      return `<div class="alert-banner ${sev}">
+        <div class="alert-icon">${icon}</div>
+        <div>
+          <div class="alert-title">${c.complaint_id} — ${c.oem_id} | ${c.defect_description?.slice(0,50) || '—'}…</div>
+          <div class="alert-body">${c.affected_order_ids.join(', ')} · ${c.root_cause_identified?.slice(0,60) || '—'}… · ₹${c.financial_impact_inr.toLocaleString('en-IN')}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
 }
 
-// ══════════════════════════════════════════
-// RISK TABLE
-// ══════════════════════════════════════════
-function renderRiskTable(){
+function riskBadge(score) {
+  if (score > 70) return `<span class="tag tag-red">🔴 ${score}</span>`;
+  if (score > 40) return `<span class="tag tag-yellow">🟡 ${score}</span>`;
+  return `<span class="tag tag-green">🟢 ${score}</span>`;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// RISK TABLE — FROM REAL DATA
+// ══════════════════════════════════════════════════════════════════════════
+function renderRiskTable() {
+  if (!ALL_RISK_DATA.length) {
+    document.getElementById('risk-tbody').innerHTML =
+      '<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:20px;">Upload production + QC CSV files to compute risk scores</td></tr>';
+    ['risk-count-high','risk-count-med','risk-count-low'].forEach(id => document.getElementById(id).textContent = '—');
+    return;
+  }
+
   const filter = document.getElementById('risk-filter').value;
-  const sort = document.getElementById('risk-sort').value;
+  const sort   = document.getElementById('risk-sort').value;
   let data = [...ALL_RISK_DATA];
 
-  if(filter==='high') data=data.filter(r=>r.score>70);
-  else if(filter==='med') data=data.filter(r=>r.score>=40&&r.score<=70);
-  else if(filter==='low') data=data.filter(r=>r.score<40);
+  if (filter === 'high') data = data.filter(r => r.score > 70);
+  else if (filter === 'med') data = data.filter(r => r.score >= 40 && r.score <= 70);
+  else if (filter === 'low') data = data.filter(r => r.score < 40);
 
-  if(sort==='score-desc') data.sort((a,b)=>b.score-a.score);
-  else if(sort==='score-asc') data.sort((a,b)=>a.score-b.score);
-  else data.sort((a,b)=>a.batch.localeCompare(b.batch));
+  if (sort === 'score-desc')   data.sort((a, b) => b.score - a.score);
+  else if (sort === 'score-asc') data.sort((a, b) => a.score - b.score);
+  else data.sort((a, b) => a.batch.localeCompare(b.batch));
 
-  const high=ALL_RISK_DATA.filter(r=>r.score>70).length;
-  const med=ALL_RISK_DATA.filter(r=>r.score>=40&&r.score<=70).length;
-  const low=ALL_RISK_DATA.filter(r=>r.score<40).length;
-  document.getElementById('risk-count-high').textContent=high;
-  document.getElementById('risk-count-med').textContent=med;
-  document.getElementById('risk-count-low').textContent=low;
-  document.getElementById('kpi-highrisk').textContent=high;
+  const high = ALL_RISK_DATA.filter(r => r.score > 70).length;
+  const med  = ALL_RISK_DATA.filter(r => r.score >= 40 && r.score <= 70).length;
+  const low  = ALL_RISK_DATA.filter(r => r.score < 40).length;
+  document.getElementById('risk-count-high').textContent = high;
+  document.getElementById('risk-count-med').textContent  = med;
+  document.getElementById('risk-count-low').textContent  = low;
+  document.getElementById('kpi-highrisk').textContent    = high;
 
-  document.getElementById('risk-tbody').innerHTML = data.slice(0,50).map(r=>{
+  // Identify risky lots and machines from real data
+  const lotGradeC   = new Set(rawMaterials.filter(r => r.quality_grade === 'C').map(r => r.lot_number));
+  const machRates   = computeMachineRiskFactor();
+  const worstMach   = Object.entries(machRates).sort((a,b) => b[1]-a[1]).slice(0,1).map(e => e[0]);
+
+  document.getElementById('risk-tbody').innerHTML = data.slice(0, 50).map(r => {
     const isBlocked = blockedBatches.has(r.batch);
-    const factors = [];
-    if(knownBadLots.includes(r.lot)) factors.push('⚠ Bad Lot');
-    if(knownBadMachines.includes(r.machine)) factors.push('⚙ MC-03');
-    if(r.qc==='FAIL') factors.push('❌ QC Fail');
-    if(r.shift==='B') factors.push('🌙 Shift B');
-    return `<tr class="${r.score>70?'risk-high':r.score>40?'risk-med':'risk-low'}">
+    const factors   = [];
+    if (lotGradeC.has(r.lot)) factors.push('⚠ Grade C Lot');
+    if (worstMach.includes(r.machine)) factors.push(`⚙ ${r.machine} high fail`);
+    if (r.qc === 'FAIL') factors.push('❌ QC Fail');
+    if (r.shift === 'B') factors.push('🌙 Shift B');
+    if (r.confidence === 'INFERRED') factors.push('⟳ Inferred ID');
+
+    return `<tr class="${r.score > 70 ? 'risk-high' : r.score > 40 ? 'risk-med' : 'risk-low'}">
       <td style="color:var(--accent)">${r.batch}</td>
       <td style="font-size:11px">${r.lot}</td>
       <td>${r.machine}</td>
       <td>${r.shift}</td>
-      <td>${r.qc==='FAIL'?'<span class="tag tag-red">FAIL</span>':'<span class="tag tag-green">PASS</span>'}</td>
-      <td style="font-size:11px">${r.defect||'—'}</td>
+      <td>${r.qc === 'FAIL' ? '<span class="tag tag-red">FAIL</span>' : r.qc === 'PASS' ? '<span class="tag tag-green">PASS</span>' : '<span class="tag tag-yellow">?</span>'}</td>
+      <td style="font-size:11px">${r.defect || '—'}</td>
       <td>
         <div class="risk-meter">
           <div class="risk-bar-bg" style="width:100px">
@@ -1898,206 +2417,212 @@ function renderRiskTable(){
           <span class="risk-score-val" style="color:${r.score>70?'var(--red)':r.score>40?'var(--yellow)':'var(--green)'}">${r.score}</span>
         </div>
       </td>
-      <td style="font-size:10px">${factors.join(' ')}</td>
+      <td style="font-size:10px">${factors.join(' ') || '—'}</td>
       <td>
-        ${isBlocked?'<span class="blocked-badge">🚫 BLOCKED</span>':
-          r.score>70?`<button class="btn btn-danger btn-sm" onclick="blockBatch('${r.batch}',this)">🚫 Block</button>`:
+        ${isBlocked ? '<span class="blocked-badge">🚫 BLOCKED</span>' :
+          r.score > 70 ? `<button class="btn btn-danger btn-sm" onclick="blockBatch('${r.batch}',this)">🚫 Block</button>` :
           '<span class="tag tag-green">✓ OK</span>'}
       </td>
     </tr>`;
   }).join('');
 }
 
-function blockBatch(batch, btn){
+function blockBatch(batch, btn) {
   blockedBatches.add(batch);
   btn.parentElement.innerHTML = '<span class="blocked-badge">🚫 BLOCKED</span>';
   const msg = document.createElement('div');
-  msg.className='alert-banner danger';
-  msg.innerHTML=`<div class="alert-icon">🚫</div><div><div class="alert-title">Batch ${batch} — Blocked from Dispatch</div><div class="alert-body">Added to block list. Cannot proceed to dispatch. Supervisor notified.</div></div>`;
+  msg.className = 'alert-banner danger';
+  msg.innerHTML = `<div class="alert-icon">🚫</div><div><div class="alert-title">Batch ${batch} — Blocked from Dispatch</div><div class="alert-body">Added to block list.</div></div>`;
   document.querySelector('#page-risk .page-inner').prepend(msg);
-  setTimeout(()=>msg.remove(),4000);
+  setTimeout(() => msg.remove(), 4000);
 }
 
-function blockAllHigh(){
-  ALL_RISK_DATA.filter(r=>r.score>70).forEach(r=>blockedBatches.add(r.batch));
+function blockAllHigh() {
+  ALL_RISK_DATA.filter(r => r.score > 70).forEach(r => blockedBatches.add(r.batch));
   renderRiskTable();
-  alert(`✓ ${ALL_RISK_DATA.filter(r=>r.score>70).length} high-risk batches blocked from dispatch.`);
+  alert(`✓ ${ALL_RISK_DATA.filter(r => r.score > 70).length} high-risk batches blocked from dispatch.`);
 }
 
-// ══════════════════════════════════════════
-// BI DASHBOARD
-// ══════════════════════════════════════════
-function renderBI(){
-  // Supplier chart
-  const supplierData = [
-    {label:'S03 Sundaram',val:7,pct:100,color:'var(--red)'},
-    {label:'S04 JK Rubber',val:4,pct:57,color:'var(--yellow)'},
-    {label:'S01 Tata Metal',val:3,pct:43,color:'var(--yellow)'},
-    {label:'S06 Anand Auto',val:2,pct:29,color:'var(--yellow)'},
-    {label:'S02 Minda',val:1,pct:14,color:'var(--green)'},
-    {label:'S05 Minda Riv',val:1,pct:14,color:'var(--green)'},
-  ];
-  document.getElementById('bi-supplier-chart').innerHTML = supplierData.map(d=>
-    `<div class="chart-bar-row">
-      <div class="chart-bar-label">${d.label}</div>
-      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${d.pct}%;background:${d.color}">${d.val}</div></div>
-      <div class="chart-bar-val">${d.val} defects</div>
-    </div>`).join('');
 
-  // Machine chart
-  const machData = [
-    {label:'MC-03',val:62,pct:100,color:'var(--red)'},
-    {label:'MC-01',val:71,pct:90,color:'var(--yellow)'},
-    {label:'MC-05',val:68,pct:85,color:'var(--yellow)'},
-    {label:'MC-04',val:55,pct:70,color:'var(--yellow)'},
-    {label:'MC-02',val:48,pct:60,color:'var(--green)'},
-  ];
-  document.getElementById('bi-machine-chart').innerHTML = machData.map(d=>
-    `<div class="chart-bar-row">
-      <div class="chart-bar-label">${d.label}</div>
-      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${d.pct}%;background:${d.color}">${d.val}</div></div>
-      <div class="chart-bar-val">${d.val} fails</div>
-    </div>`).join('');
+// ══════════════════════════════════════════════════════════════════════════
+// BI DASHBOARD — FROM REAL DATA
+// ══════════════════════════════════════════════════════════════════════════
+function renderBI() {
+  if (!ALL_RISK_DATA.length) return;
 
-  // Shift chart
-  const shiftData = [
-    {label:'Shift B (2pm)',val:158,pct:100,color:'var(--red)'},
-    {label:'Shift C (10pm)',val:107,pct:68,color:'var(--yellow)'},
-    {label:'Shift A (6am)',val:80,pct:51,color:'var(--green)'},
-  ];
-  document.getElementById('bi-shift-chart').innerHTML = shiftData.map(d=>
-    `<div class="chart-bar-row">
-      <div class="chart-bar-label">${d.label}</div>
-      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${d.pct}%;background:${d.color}">${d.val}</div></div>
-      <div class="chart-bar-val">${d.val} defects</div>
-    </div>`).join('') +
-    `<div class="alert-banner warning mt8" style="padding:8px 12px">
-      <div class="alert-icon">💡</div>
-      <div class="small"><strong>Insight:</strong> Shift B has 97% more defects than Shift A. Consider: supervisor review, fatigue analysis, tooling condition check before Shift B.</div>
+  // Supplier defect chart
+  const supFails = {};
+  qc.filter(q => q.pass_fail === 'FAIL').forEach(q => {
+    const p = mapBatchToProduction[q.batch_id];
+    if (!p) return;
+    const sup = mapLotToSupplier[p.input_lot_ref] || {};
+    const key = sup.supplier_name || sup.supplier_id || 'Unknown';
+    supFails[key] = (supFails[key] || 0) + 1;
+  });
+  const supEntries = Object.entries(supFails).sort((a,b) => b[1]-a[1]).slice(0,6);
+  const maxSup = Math.max(...supEntries.map(e => e[1]), 1);
+  document.getElementById('bi-supplier-chart').innerHTML = supEntries.map(([name, val]) => {
+    const pct = Math.round((val / maxSup) * 100);
+    const color = pct > 60 ? 'var(--red)' : pct > 30 ? 'var(--yellow)' : 'var(--green)';
+    return `<div class="chart-bar-row">
+      <div class="chart-bar-label" title="${name}">${name.slice(0,14)}</div>
+      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${pct}%;background:${color}">${val}</div></div>
+      <div class="chart-bar-val">${val} defects</div>
     </div>`;
+  }).join('') || '<div class="small muted" style="padding:8px">No failure data</div>';
 
-  // Defect type
-  const defData = [
-    {label:'Surface Delam',val:125,pct:100,color:'var(--red)'},
-    {label:'Dim Deviation',val:118,pct:94,color:'var(--yellow)'},
-    {label:'Edge Crack',val:102,pct:82,color:'var(--orange)'},
-  ];
-  document.getElementById('bi-defect-chart').innerHTML = defData.map(d=>
-    `<div class="chart-bar-row">
-      <div class="chart-bar-label">${d.label}</div>
-      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${d.pct}%;background:${d.color}">${d.val}</div></div>
-      <div class="chart-bar-val">${d.val}</div>
-    </div>`).join('');
+  // Machine defect chart
+  const machCounts = {};
+  const machTotals = {};
+  production.forEach(p => {
+    machTotals[p.machine_id] = (machTotals[p.machine_id] || 0) + 1;
+    const qr = mapBatchToQC[p.batch_id];
+    if (qr?.pass_fail === 'FAIL') machCounts[p.machine_id] = (machCounts[p.machine_id] || 0) + 1;
+  });
+  const machEntries = Object.keys(machTotals).sort()
+    .map(m => ({ m, fails: machCounts[m]||0, total: machTotals[m], rate: Math.round(((machCounts[m]||0)/machTotals[m])*100) }))
+    .sort((a,b) => b.fails - a.fails).slice(0,6);
+  const maxMF = Math.max(...machEntries.map(e => e.fails), 1);
+  document.getElementById('bi-machine-chart').innerHTML = machEntries.map(({ m, fails, rate }) => {
+    const pct   = Math.round((fails / maxMF) * 100);
+    const color = rate > 10 ? 'var(--red)' : rate > 5 ? 'var(--yellow)' : 'var(--green)';
+    return `<div class="chart-bar-row">
+      <div class="chart-bar-label">${m}</div>
+      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${pct}%;background:${color}">${fails}</div></div>
+      <div class="chart-bar-val">${rate}% fail</div>
+    </div>`;
+  }).join('');
 
-  // Monthly
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug'];
-  const monthly = [22,31,28,19,45,52,38,44];
-  const maxM = Math.max(...monthly);
-  document.getElementById('bi-monthly-chart').innerHTML = months.map((m,i)=>
-    `<div class="chart-bar-row">
-      <div class="chart-bar-label">${m} 2024</div>
-      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${(monthly[i]/maxM*100).toFixed(0)}%;background:${monthly[i]>40?'var(--red)':'var(--yellow)'}">${monthly[i]}</div></div>
-      <div class="chart-bar-val">${monthly[i]}</div>
-    </div>`).join('');
+  // Shift defect chart
+  const shiftFails = {A:0, B:0, C:0};
+  const shiftTotal = {A:0, B:0, C:0};
+  production.forEach(p => {
+    shiftTotal[p.shift] = (shiftTotal[p.shift]||0) + 1;
+    const qr = mapBatchToQC[p.batch_id];
+    if (qr?.pass_fail === 'FAIL') shiftFails[p.shift] = (shiftFails[p.shift]||0) + 1;
+  });
+  const maxShift = Math.max(...Object.values(shiftFails), 1);
+  document.getElementById('bi-shift-chart').innerHTML = ['A','B','C'].map(s => {
+    const pct = Math.round((shiftFails[s] / maxShift) * 100);
+    return `<div class="chart-bar-row">
+      <div class="chart-bar-label">Shift ${s}</div>
+      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${pct}%;background:${pct>70?'var(--red)':'var(--yellow)'}">${shiftFails[s]}</div></div>
+      <div class="chart-bar-val">${shiftFails[s]} fails / ${shiftTotal[s]||0} total</div>
+    </div>`;
+  }).join('');
 
-  // Operator
-  const ops = ['OP-019','OP-013','OP-005','OP-003','OP-009'];
-  const opFails = [28,22,18,14,11];
-  const maxOp = Math.max(...opFails);
-  document.getElementById('bi-operator-chart').innerHTML = ops.map((o,i)=>
-    `<div class="chart-bar-row">
-      <div class="chart-bar-label">${o}</div>
-      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${(opFails[i]/maxOp*100).toFixed(0)}%;background:${opFails[i]>20?'var(--red)':'var(--yellow)'}">${opFails[i]}</div></div>
-      <div class="chart-bar-val">${opFails[i]} fails</div>
-    </div>`).join('');
-}
+  // Defect type distribution
+  const defectCounts = {};
+  qc.filter(q => q.pass_fail === 'FAIL' && q.defect_type).forEach(q => {
+    defectCounts[q.defect_type] = (defectCounts[q.defect_type] || 0) + 1;
+  });
+  const defEntries = Object.entries(defectCounts).sort((a,b) => b[1]-a[1]);
+  const maxDef = Math.max(...defEntries.map(e => e[1]), 1);
+  document.getElementById('bi-defect-chart').innerHTML = defEntries.map(([type, count]) => {
+    const pct = Math.round((count / maxDef) * 100);
+    return `<div class="chart-bar-row">
+      <div class="chart-bar-label" title="${type}">${type.slice(0,18)}</div>
+      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${pct}%;background:var(--red)">${count}</div></div>
+      <div class="chart-bar-val">${count}</div>
+    </div>`;
+  }).join('') || '<div class="small muted" style="padding:8px">No defect data</div>';
 
-// ══════════════════════════════════════════
-// OPERATOR FORM
-// ══════════════════════════════════════════
-function generateBatchPreview(){
-  const batch = `BATCH-2024-${String(opBatchCounter).padStart(4,'0')}`;
-  document.getElementById('op-batch-preview').textContent = batch;
-}
+  // Monthly failures
+  const monthFails = {};
+  qc.filter(q => q.pass_fail === 'FAIL' && q.inspection_date).forEach(q => {
+    const m = q.inspection_date.slice(0, 7); // YYYY-MM
+    monthFails[m] = (monthFails[m] || 0) + 1;
+  });
+  const months = Object.keys(monthFails).sort().slice(-12);
+  const maxMonth = Math.max(...months.map(m => monthFails[m]), 1);
+  document.getElementById('bi-monthly-chart').innerHTML = months.map(m => {
+    const val = monthFails[m];
+    const pct = Math.round((val / maxMonth) * 100);
+    return `<div class="chart-bar-row">
+      <div class="chart-bar-label">${m.slice(5)}</div>
+      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${pct}%;background:${val>40?'var(--red)':'var(--yellow)'}">${val}</div></div>
+      <div class="chart-bar-val">${val}</div>
+    </div>`;
+  }).join('') || '<div class="small muted" style="padding:8px">No monthly data</div>';
 
-function toggleDefect(){
-  const val = document.getElementById('qc-result').value;
-  document.getElementById('qc-defect-row').style.display = val==='FAIL'?'block':'none';
-  document.getElementById('qc-risk-preview').style.display = val==='FAIL'?'block':'none';
-}
+  // Operator performance
+  const opFails = {};
+  const opTotals = {};
+  production.forEach(p => {
+    if (!p.operator_id) return;
+    opTotals[p.operator_id] = (opTotals[p.operator_id]||0) + 1;
+    const qr = mapBatchToQC[p.batch_id];
+    if (qr?.pass_fail === 'FAIL') opFails[p.operator_id] = (opFails[p.operator_id]||0) + 1;
+  });
+  const opEntries = Object.entries(opFails).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  const maxOp = Math.max(...opEntries.map(e=>e[1]), 1);
+  document.getElementById('bi-operator-chart').innerHTML = opEntries.map(([op, fails]) => {
+    const pct = Math.round((fails/maxOp)*100);
+    return `<div class="chart-bar-row">
+      <div class="chart-bar-label">${op}</div>
+      <div class="chart-bar-bg"><div class="chart-bar-fill" style="width:${pct}%;background:${pct>60?'var(--red)':'var(--yellow)'}">${fails}</div></div>
+      <div class="chart-bar-val">${fails} fails</div>
+    </div>`;
+  }).join('') || '<div class="small muted" style="padding:8px">No operator data</div>';
 
-function submitProduction(){
-  const shift=document.getElementById('op-shift').value;
-  const machine=document.getElementById('op-machine').value;
-  const op=document.getElementById('op-operator').value;
-  const lot=document.getElementById('op-lot').value;
-  const units=document.getElementById('op-units').value;
-  if(!shift||!machine||!op||!lot||!units){
-    document.getElementById('op-prod-msg').innerHTML='<span style="color:var(--red)">⚠ सर्व रकाने भरा / Fill all fields</span>';
-    return;
+  // Customer complaint summary from real complaints
+  const custImpact = {};
+  complaints.forEach(c => {
+    custImpact[c.oem_id] = (custImpact[c.oem_id] || { count:0, impact:0 });
+    custImpact[c.oem_id].count++;
+    custImpact[c.oem_id].impact += c.financial_impact_inr;
+  });
+  // For entries in dispatch without complaints, aggregate by customer
+  if (Object.keys(custImpact).length === 0) {
+    dispatch.forEach(d => { custImpact[d.customer_id] = custImpact[d.customer_id] || {count:0,impact:0}; });
   }
-  opBatchCounter++;
-  pendingEntries++;
-  generateBatchPreview();
-  document.getElementById('offline-pending-count').textContent=pendingEntries;
-  document.getElementById('op-prod-msg').innerHTML=`<span style="color:var(--green)">✓ BATCH-2024-${opBatchCounter-1} saved locally · Pending sync</span>`;
 }
 
-function clearProductionForm(){
-  ['op-shift','op-machine','op-operator','op-lot'].forEach(id=>document.getElementById(id).value='');
-  document.getElementById('op-units').value='';
-  document.getElementById('op-prod-msg').innerHTML='';
-}
 
-function submitQC(){
-  const batch=document.getElementById('qc-batch').value;
-  const inspector=document.getElementById('qc-inspector').value;
-  const result=document.getElementById('qc-result').value;
-  if(!batch||!inspector||!result){
-    document.getElementById('op-qc-msg').innerHTML='<span style="color:var(--red)">⚠ सर्व रकाने भरा / Fill all fields</span>';
-    return;
-  }
-  pendingEntries++;
-  document.getElementById('offline-pending-count').textContent=pendingEntries;
-  document.getElementById('op-qc-msg').innerHTML=`<span style="color:var(--green)">✓ QC entry saved · ${result==='FAIL'?'🔴 HIGH RISK — Supervisor notified':'✅ Passed'}</span>`;
-}
+// ══════════════════════════════════════════════════════════════════════════
+// RECALL REPORT MODAL — FROM REAL DATA
+// ══════════════════════════════════════════════════════════════════════════
+function openReportModal(type, lot) {
+  document.getElementById('report-date').textContent =
+    new Date().toLocaleDateString('en-IN', {day:'2-digit',month:'long',year:'numeric'});
 
-function clearQCForm(){
-  ['qc-batch','qc-inspector','qc-result','qc-defect','qc-rework'].forEach(id=>document.getElementById(id).value='');
-  document.getElementById('qc-defect-rate').value='';
-  document.getElementById('qc-defect-row').style.display='none';
-  document.getElementById('qc-risk-preview').style.display='none';
-  document.getElementById('op-qc-msg').innerHTML='';
-}
-
-function simulateSync(){
-  const btn = document.getElementById('sync-btn');
-  btn.innerHTML='<span class="spinner"></span> Syncing...';
-  btn.disabled=true;
-  setTimeout(()=>{
-    btn.innerHTML='↑ Sync to Server';
-    btn.disabled=false;
-    document.getElementById('sync-msg').innerHTML=`<span style="color:var(--green)">✓ ${pendingEntries} entries synced at ${new Date().toLocaleTimeString()}</span>`;
-    pendingEntries=0;
-    document.getElementById('offline-pending-count').textContent=0;
-    document.getElementById('status-dot').style.background='var(--green)';
-    document.getElementById('status-label').textContent='ONLINE';
-    setTimeout(()=>{
-      document.getElementById('status-dot').style.background='var(--yellow)';
-      document.getElementById('status-label').textContent='OFFLINE';
-    },5000);
-  },2200);
-}
-
-// ══════════════════════════════════════════
-// RECALL REPORT MODAL
-// ══════════════════════════════════════════
-function openReportModal(type, lot){
-  document.getElementById('report-date').textContent = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'long',year:'numeric'});
   const body = document.getElementById('report-body');
-  const affectedOrders = type==='contam'&&lot==='LOT-2023-114'?['D-1847','D-1921','D-1367','D-1890']:
-    type==='trace'?['D-1847']:['D-1847','D-1921','D-1367'];
-  const impact = type==='contam'&&lot==='LOT-2023-114'?294500:185000;
+
+  // Determine lot, batches, orders from real data
+  let reportLot = lot || '';
+  let affectedBatchIds = [];
+  let affectedOrders   = [];
+  let supRow    = {};
+  let rawRow    = {};
+  let estImpact = 0;
+
+  if (type === 'trace') {
+    // Get from current trace display
+    const batchEl = document.getElementById('trace-chain-nodes');
+    const titleEls = batchEl?.querySelectorAll('.trace-title');
+    if (titleEls?.length >= 3) {
+      reportLot = titleEls[0]?.textContent || '';
+      affectedBatchIds = [titleEls[2]?.textContent?.trim() || ''];
+    }
+    const dispatchEls = document.getElementById('trace-query-label');
+    const oid = dispatchEls?.textContent?.trim() || '';
+    if (oid.startsWith('D-')) affectedOrders = [oid];
+  }
+
+  if (!reportLot && type === 'contam') reportLot = document.getElementById('contam-lot')?.value || '';
+
+  if (reportLot && mapLotToProduction[reportLot]) {
+    affectedBatchIds = [...new Set((mapLotToProduction[reportLot] || []).map(p => p.batch_id).filter(Boolean))];
+    const ordersSet = new Set();
+    affectedBatchIds.forEach(b => (mapBatchToDispatch[b]||[]).forEach(d => ordersSet.add(d.order_id)));
+    affectedOrders = [...ordersSet];
+    rawRow = (mapLotToRawMaterials[reportLot]||[])[0] || {};
+    supRow = mapLotToSupplier[reportLot] || {};
+  }
+
+  const relComplaints = complaints.filter(c => c.affected_order_ids.some(o => affectedOrders.includes(o)));
+  estImpact = relComplaints.reduce((s,c) => s+c.financial_impact_inr, 0) ||
+              affectedOrders.length * 45000;
 
   body.innerHTML = `
     <div class="alert-banner danger mb16">
@@ -2107,98 +2632,312 @@ function openReportModal(type, lot){
         <div class="alert-body">Auto-generated by TraceAI v2.0 · ${new Date().toLocaleString('en-IN')}</div>
       </div>
     </div>
-
     <div class="grid-2 mb16">
       <div>
-        <div class="section-title">Defective Lot</div>
-        <div class="mono highlight" style="font-size:16px;margin-bottom:4px;">LOT-2023-114</div>
-        <div class="small muted">Sundaram Clayton — Adhesive bonding agent</div>
-        <div class="tag tag-red mt8">Grade C — Below specification</div>
+        <div class="section-title">Defective / Suspect Lot</div>
+        <div class="mono highlight" style="font-size:16px;margin-bottom:4px;">${reportLot || '—'}</div>
+        <div class="small muted">${supRow.supplier_name || rawRow.supplier_id || '—'} — ${rawRow.material_type || supRow.material_supplied || '—'}</div>
+        <div class="tag ${rawRow.quality_grade==='C'?'tag-red':rawRow.quality_grade==='B'?'tag-yellow':'tag-blue'} mt8">Grade ${rawRow.quality_grade||'—'}</div>
       </div>
       <div>
         <div class="section-title">Estimated Financial Impact</div>
-        <div class="mono" style="font-size:22px;color:var(--red);font-weight:700;">₹${impact.toLocaleString('en-IN')}</div>
+        <div class="mono" style="font-size:22px;color:var(--red);font-weight:700;">₹${estImpact.toLocaleString('en-IN')}</div>
         <div class="small muted">Replacement + logistics + OEM penalty</div>
       </div>
     </div>
-
-    <div class="section-title">Affected Batches</div>
+    <div class="section-title">Affected Batches (${affectedBatchIds.length})</div>
     <div class="flex gap8 mb16" style="flex-wrap:wrap">
-      ${['BATCH-2023-0088','BATCH-2023-0101','BATCH-2023-0114','BATCH-2023-0115','BATCH-2023-0116'].map(b=>
-        `<span class="tag tag-red">${b}</span>`).join('')}
+      ${affectedBatchIds.slice(0,10).map(b=>`<span class="tag tag-red">${b}</span>`).join('')}
+      ${affectedBatchIds.length>10?`<span class="tag tag-yellow">+${affectedBatchIds.length-10} more</span>`:''}
+      ${!affectedBatchIds.length?'<span class="small muted">None found in loaded data</span>':''}
     </div>
-
     <div class="section-title">Affected Orders & Customers</div>
     <table class="data-table mb16">
       <thead><tr><th>Order ID</th><th>Customer</th><th>Product</th><th>Qty</th><th>Status</th><th>Action</th></tr></thead>
       <tbody>
-        ${affectedOrders.map((oid,i)=>{
-          const custs=['OEM-TATA','OEM-TATA','OEM-BAJAJ','OEM-TATA'];
-          const qtys=[340,220,55,180];
-          const statuses=['Delivered','Delivered','Delivered','In Transit'];
-          return `<tr><td>${oid}</td><td>${custs[i]||'OEM-TATA'}</td><td>Brake Pad Type A</td><td>${qtys[i]||200}</td>
-            <td>${statuses[i]==='Delivered'?'<span class="tag tag-red">Delivered</span>':'<span class="tag tag-yellow">In Transit</span>'}</td>
-            <td>${statuses[i]==='Delivered'?'Notify + Replace':'Hold Shipment'}</td></tr>`;
-        }).join('')}
+        ${affectedOrders.length ? affectedOrders.map(oid => {
+          const d = mapOrderToDispatch[oid] || {};
+          const status = getShipmentStatus(oid, d.dispatch_date);
+          return `<tr><td>${oid}</td><td>${d.customer_id||'—'}</td><td>${d.product_type||'—'}</td><td>${d.quantity||'—'}</td>
+            <td>${status==='Delivered'?'<span class="tag tag-red">Delivered</span>':status==='In Transit'?'<span class="tag tag-yellow">In Transit</span>':'<span class="tag tag-blue">Not Shipped</span>'}</td>
+            <td>${status==='In Transit'?'Hold Shipment':'Notify + Replace'}</td></tr>`;
+        }).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text3)">No dispatch orders found</td></tr>'}
       </tbody>
     </table>
-
     <div class="section-title">Recommended Actions</div>
     <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
       <div class="alert-banner danger" style="padding:10px 14px">
         <div class="alert-icon">🔴</div>
         <div><div class="alert-title">1. QUARANTINE — Immediate</div>
-        <div class="alert-body">Isolate all batches from LOT-2023-114. Tag: "HOLD — DO NOT DISPATCH". QC Manager to sign-off.</div></div>
+        <div class="alert-body">Isolate all batches from ${reportLot}. Tag: "HOLD — DO NOT DISPATCH". QC Manager to sign-off.</div></div>
       </div>
       <div class="alert-banner warning" style="padding:10px 14px">
         <div class="alert-icon">📧</div>
         <div><div class="alert-title">2. NOTIFY OEM Customers</div>
-        <div class="alert-body">Send recall notice to OEM-TATA and OEM-BAJAJ within 24 hours. Attach this report. Provide replacement ETA.</div></div>
-      </div>
-      <div class="alert-banner warning" style="padding:10px 14px">
-        <div class="alert-icon">🛑</div>
-        <div><div class="alert-title">3. HOLD Shipments in Transit</div>
-        <div class="alert-body">Order D-1890 (In Transit) — Contact MH12-3350 driver. Redirect to warehouse. Do not deliver.</div></div>
+        <div class="alert-body">Send recall notice to ${[...new Set(affectedOrders.map(o=>mapOrderToDispatch[o]?.customer_id).filter(Boolean))].join(', ')||'affected customers'} within 24 hours.</div></div>
       </div>
       <div class="alert-banner info" style="padding:10px 14px">
         <div class="alert-icon">🏭</div>
-        <div><div class="alert-title">4. SUPPLIER ACTION</div>
-        <div class="alert-body">Issue formal NCR (Non-Conformance Report) to Sundaram Clayton S03. Request root cause analysis within 7 days. Review approved supplier status.</div></div>
+        <div><div class="alert-title">3. SUPPLIER ACTION</div>
+        <div class="alert-body">Issue NCR to ${supRow.supplier_name||'supplier'}. Request root cause analysis within 7 days.</div></div>
       </div>
     </div>
-
     <div style="background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:12px;font-size:11px;color:var(--text3)">
-      Report ID: RECALL-${Date.now().toString(36).toUpperCase()} · Generated by TraceAI v2.0 · ${new Date().toLocaleString()} · All data sourced from factory CSV records.
+      Report ID: RECALL-${Date.now().toString(36).toUpperCase()} · Generated by TraceAI v2.0 · ${new Date().toLocaleString()} · Data sourced from uploaded CSV records.
     </div>`;
 
   document.getElementById('report-modal').classList.add('open');
 }
 
-function closeReportModal(){ document.getElementById('report-modal').classList.remove('open'); }
-function printReport(){ window.print(); }
+function closeReportModal() { document.getElementById('report-modal').classList.remove('open'); }
+function printReport() { window.print(); }
 
-// File upload handlers
-function triggerUpload(type){ document.getElementById('file-'+type).click(); }
-function handleUpload(type, input){
-  if(input.files.length){
-    const zone = document.getElementById('zone-'+type);
-    zone.querySelector('.tag').className='tag tag-green';
-    zone.querySelector('.tag').textContent='✓ File loaded';
-  }
+
+// ══════════════════════════════════════════════════════════════════════════
+// LINK STATUS PANEL — FROM REAL DATA
+// ══════════════════════════════════════════════════════════════════════════
+function updateLinkStatus() {
+  const totalProd   = production.length;
+  const withBatch   = production.filter(p => p.batch_id && !p._confidence).length;
+  const inferred    = production.filter(p => p._confidence === 'INFERRED').length;
+  const qcLinked    = qc.filter(q => mapBatchToProduction[q.batch_id]).length;
+  const dispLinked  = dispatch.filter(d => d.batch_refs.some(b => mapBatchToProduction[b])).length;
+  const multiBatch  = dispatch.filter(d => d.batch_refs.length > 1).length;
+
+  const el = document.getElementById('link-status');
+  if (!el) return;
+  el.innerHTML = `
+    <div class="flex align-center justify-between mt8" style="margin-bottom:12px;">
+      <div><div style="font-size:12px;font-weight:500;">Raw Lots → Production Batches</div><div class="small muted">Direct lot reference match</div></div>
+      <div class="flex align-center gap8">
+        <span class="tag tag-green">✓ EXACT</span>
+        <span style="font-size:12px;font-family:var(--mono);color:var(--text2)">${withBatch} / ${totalProd}</span>
+      </div>
+    </div>
+    <div class="progress-bar-bg mb16"><div class="progress-bar-fill" style="width:${totalProd?Math.round(withBatch/totalProd*100):0}%;background:var(--green)"></div></div>
+
+    <div class="flex align-center justify-between" style="margin-bottom:8px;">
+      <div><div style="font-size:12px;font-weight:500;">Missing Batch IDs → Inferred</div><div class="small muted">Date + machine + shift grouping</div></div>
+      <div class="flex align-center gap8">
+        <span class="tag tag-yellow">⟳ INFERRED</span>
+        <span style="font-size:12px;font-family:var(--mono);color:var(--text2)">${inferred} rows</span>
+      </div>
+    </div>
+    <div class="progress-bar-bg mb16"><div class="progress-bar-fill" style="width:${totalProd?Math.round(inferred/totalProd*100):0}%;background:var(--yellow)"></div></div>
+
+    <div class="flex align-center justify-between" style="margin-bottom:8px;">
+      <div><div style="font-size:12px;font-weight:500;">Production → QC Linking</div><div class="small muted">Batch ID exact match</div></div>
+      <div class="flex align-center gap8">
+        <span class="tag tag-green">✓ EXACT</span>
+        <span style="font-size:12px;font-family:var(--mono);color:var(--text2)">${qcLinked} / ${qc.length}</span>
+      </div>
+    </div>
+    <div class="progress-bar-bg mb16"><div class="progress-bar-fill" style="width:${qc.length?Math.round(qcLinked/qc.length*100):0}%;background:var(--green)"></div></div>
+
+    <div class="flex align-center justify-between" style="margin-bottom:8px;">
+      <div><div style="font-size:12px;font-weight:500;">QC → Dispatch Linking</div><div class="small muted">Batch ref + multi-batch dispatch resolved (${multiBatch} multi-batch orders)</div></div>
+      <div class="flex align-center gap8">
+        <span class="tag tag-green">✓ EXACT</span>
+        <span style="font-size:12px;font-family:var(--mono);color:var(--text2)">${dispLinked} / ${dispatch.length}</span>
+      </div>
+    </div>
+    <div class="progress-bar-bg mb16"><div class="progress-bar-fill" style="width:${dispatch.length?Math.round(dispLinked/dispatch.length*100):0}%;background:var(--green)"></div></div>`;
 }
 
-// ══════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════
+// CONTAMINATION LOT DROPDOWN — DYNAMIC FROM REAL DATA
+// ══════════════════════════════════════════════════════════════════════════
+function updateContamDropdown() {
+  const sel = document.getElementById('contam-lot');
+  const existing = new Set([...sel.options].map(o => o.value).filter(Boolean));
+  const gradeCLots = rawMaterials.filter(r => r.quality_grade === 'C').map(r => r.lot_number);
+  const allLots    = [...new Set(rawMaterials.map(r => r.lot_number))].sort();
+
+  // Add grade C lots first, then others
+  const toAdd = [...new Set([...gradeCLots, ...allLots])];
+  toAdd.forEach(lot => {
+    if (!existing.has(lot)) {
+      const opt = document.createElement('option');
+      opt.value = lot;
+      opt.textContent = gradeCLots.includes(lot) ? `${lot} (Grade C — defective)` : lot;
+      sel.appendChild(opt);
+    }
+  });
+}
+
+function populateLotDropdown() {
+  // Populate operator lot dropdown with real lot numbers
+  const sel = document.getElementById('op-lot');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">निवडा / Select</option>';
+  const lots = [...new Set(rawMaterials.map(r => r.lot_number))].sort().slice(0, 50);
+  lots.forEach(lot => {
+    const opt = document.createElement('option');
+    opt.value = lot; opt.textContent = lot;
+    sel.appendChild(opt);
+  });
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// PAGE NAVIGATION
+// ══════════════════════════════════════════════════════════════════════════
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  document.querySelector(`[data-page="${name}"]`).classList.add('active');
+  if (name === 'risk')     renderRiskTable();
+  if (name === 'bi')       renderBI();
+  if (name === 'operator') generateBatchPreview();
+}
+
+function updateTracePlaceholder() {
+  const t = document.getElementById('trace-type').value;
+  const ph = { order:'D-1847', batch:'BATCH-2023-0088', lot:'LOT-2023-114' };
+  document.getElementById('trace-input').placeholder = `Enter ${ph[t]}`;
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// OPERATOR FORM
+// ══════════════════════════════════════════════════════════════════════════
+function generateBatchPreview() {
+  const ts = Date.now().toString().slice(-6);
+  document.getElementById('op-batch-preview').textContent = `BATCH-NEW-${ts}`;
+}
+
+function toggleDefect() {
+  const val = document.getElementById('qc-result').value;
+  document.getElementById('qc-defect-row').style.display   = val === 'FAIL' ? 'block' : 'none';
+  document.getElementById('qc-risk-preview').style.display = val === 'FAIL' ? 'block' : 'none';
+}
+
+function submitProduction() {
+  const shift    = document.getElementById('op-shift').value;
+  const machine  = document.getElementById('op-machine').value;
+  const op       = document.getElementById('op-operator').value;
+  const lot      = document.getElementById('op-lot').value;
+  const units    = document.getElementById('op-units').value;
+  const dateEl   = document.getElementById('op-date');
+  const dateVal  = dateEl ? dateEl.value : new Date().toISOString().slice(0,10);
+
+  if (!shift || !machine || !op || !lot || !units) {
+    document.getElementById('op-prod-msg').innerHTML = '<span style="color:var(--red)">⚠ सर्व रकाने भरा / Fill all fields</span>';
+    return;
+  }
+  const batchId = `BATCH-NEW-${Date.now().toString().slice(-6)}`;
+  const newRow = {
+    date: normalizeDate(dateVal), shift, machine_id: machine,
+    operator_id: op, batch_id: batchId, input_lot_ref: lot,
+    units_produced: parseInt(units), cycle_time_min: 0,
+  };
+  production.push(newRow);
+  buildIndexes();
+  opBatchCounter++;
+  pendingEntries++;
+  generateBatchPreview();
+  document.getElementById('offline-pending-count').textContent = pendingEntries;
+  document.getElementById('op-prod-msg').innerHTML =
+    `<span style="color:var(--green)">✓ ${batchId} saved locally · Pending sync</span>`;
+}
+
+function clearProductionForm() {
+  ['op-shift','op-machine','op-operator','op-lot'].forEach(id => document.getElementById(id).value = '');
+  const units = document.getElementById('op-units');
+  if (units) units.value = '';
+  document.getElementById('op-prod-msg').innerHTML = '';
+}
+
+function submitQC() {
+  const batch     = document.getElementById('qc-batch').value;
+  const inspector = document.getElementById('qc-inspector').value;
+  const result    = document.getElementById('qc-result').value;
+  if (!batch || !inspector || !result) {
+    document.getElementById('op-qc-msg').innerHTML = '<span style="color:var(--red)">⚠ सर्व रकाने भरा / Fill all fields</span>';
+    return;
+  }
+  const newQC = {
+    batch_id: batch.toUpperCase(), inspection_date: new Date().toISOString().slice(0,10),
+    inspector_id: inspector, pass_fail: result,
+    defect_type: normalizeDefect(document.getElementById('qc-defect')?.value || ''),
+    defect_rate_pct: safeNum(document.getElementById('qc-defect-rate')?.value),
+    rework_flag: document.getElementById('qc-rework')?.value || 'N',
+  };
+  qc.push(newQC);
+  mapBatchToQC[newQC.batch_id] = newQC;
+  buildIndexes();
+  pendingEntries++;
+  document.getElementById('offline-pending-count').textContent = pendingEntries;
+  document.getElementById('op-qc-msg').innerHTML =
+    `<span style="color:var(--green)">✓ QC entry saved · ${result==='FAIL'?'🔴 HIGH RISK — Supervisor notified':'✅ Passed'}</span>`;
+}
+
+function clearQCForm() {
+  ['qc-batch','qc-inspector','qc-result','qc-defect','qc-rework'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const dr = document.getElementById('qc-defect-rate'); if (dr) dr.value = '';
+  const defRow = document.getElementById('qc-defect-row');     if (defRow) defRow.style.display = 'none';
+  const riskP  = document.getElementById('qc-risk-preview');   if (riskP)  riskP.style.display  = 'none';
+  document.getElementById('op-qc-msg').innerHTML = '';
+}
+
+function simulateSync() {
+  const btn = document.getElementById('sync-btn');
+  btn.innerHTML = '<span class="spinner"></span> Syncing...';
+  btn.disabled = true;
+  setTimeout(() => {
+    btn.innerHTML = '↑ Sync to Server';
+    btn.disabled = false;
+    document.getElementById('sync-msg').innerHTML =
+      `<span style="color:var(--green)">✓ ${pendingEntries} entries synced at ${new Date().toLocaleTimeString()}</span>`;
+    pendingEntries = 0;
+    document.getElementById('offline-pending-count').textContent = 0;
+    document.getElementById('status-dot').style.background = 'var(--green)';
+    document.getElementById('status-label').textContent = 'ONLINE';
+    setTimeout(() => {
+      document.getElementById('status-dot').style.background = 'var(--yellow)';
+      document.getElementById('status-label').textContent = 'OFFLINE';
+    }, 5000);
+  }, 2200);
+}
+
+function triggerUpload(type) { document.getElementById('file-' + type).click(); }
+
+
+// ══════════════════════════════════════════════════════════════════════════
 // INIT
-// ══════════════════════════════════════════
-window.addEventListener('DOMContentLoaded', ()=>{
+// ══════════════════════════════════════════════════════════════════════════
+window.addEventListener('DOMContentLoaded', () => {
   initDashboard();
   renderRiskTable();
-  // Simulate offline mode status
   document.getElementById('status-label').textContent = 'OFFLINE';
   document.getElementById('status-dot').style.background = 'var(--yellow)';
   document.getElementById('status-dot').style.boxShadow = '0 0 6px var(--yellow)';
   document.getElementById('status-label').style.color = 'var(--yellow)';
+
+  // Drag-and-drop support for upload zones
+  ['raw','prod','qc','dispatch','supplier','complaints'].forEach(type => {
+    const zone = document.getElementById('zone-' + type);
+    if (!zone) return;
+    zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+      e.preventDefault();
+      zone.classList.remove('dragover');
+      const input = document.getElementById('file-' + type);
+      if (!input || !e.dataTransfer.files.length) return;
+      // Simulate file input with dropped file
+      const dt = new DataTransfer();
+      dt.items.add(e.dataTransfer.files[0]);
+      input.files = dt.files;
+      handleUpload(type, input);
+    });
+  });
 });
+
 </script>
 </body>
 </html>
